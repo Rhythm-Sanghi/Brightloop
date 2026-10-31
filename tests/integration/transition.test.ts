@@ -1,8 +1,8 @@
-import { describe, it, expect, beforeAll } from 'vitest';
-import { prisma } from '../../../db/prisma';
-import { transitionSubscription } from '../transition';
-import { parseBusinessDate } from '../../../dates/business-date';
-import { AppError } from '../../../errors';
+import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { prisma } from '../../lib/db/prisma';
+import { transitionSubscription } from '../../lib/services/subscriptions/transition';
+import { parseBusinessDate } from '../../lib/dates/business-date';
+import { AppError } from '../../lib/errors';
 import Decimal from 'decimal.js';
 
 async function expectErrorCode(fn: Promise<any>, expectedCode: string) {
@@ -15,6 +15,7 @@ async function expectErrorCode(fn: Promise<any>, expectedCode: string) {
 }
 
 describe('Subscription Transition Lifecycle and Plan Rule Gating', () => {
+  const createdSubIds: string[] = [];
   let customerId: string;
   let staffUserId: string;
   let activePlanId: string;
@@ -135,6 +136,17 @@ describe('Subscription Transition Lifecycle and Plan Rule Gating', () => {
     minQtyPlanId = pMinQty.id;
   });
 
+  afterEach(async () => {
+    if (createdSubIds.length === 0) return;
+    const ids = [...createdSubIds];
+    // Cleanup must close every owned subscription. Errors are not swallowed.
+    await prisma.subscription.updateMany({
+      where: { id: { in: ids } },
+      data: { status: 'CLOSED' },
+    });
+    createdSubIds.length = 0;
+  });
+
   it('runs complete valid lifecycle: DRAFT -> QUOTATION -> CONFIRMED -> ACTIVE -> PAUSED -> RESUME -> CLOSED', async () => {
     // 1. Create DRAFT subscription
     const sub = await prisma.subscription.create({
@@ -151,6 +163,7 @@ describe('Subscription Transition Lifecycle and Plan Rule Gating', () => {
         },
       },
     });
+    createdSubIds.push(sub.id);
 
     // 2. SEND_QUOTATION
     const qRes = await transitionSubscription({
@@ -221,6 +234,7 @@ describe('Subscription Transition Lifecycle and Plan Rule Gating', () => {
         createdById: staffUserId,
       },
     });
+    createdSubIds.push(sub.id);
 
     await expectErrorCode(
       transitionSubscription({
@@ -258,6 +272,7 @@ describe('Subscription Transition Lifecycle and Plan Rule Gating', () => {
         },
       },
     });
+    createdSubIds.push(subInactive.id);
 
     await expectErrorCode(
       transitionSubscription({
@@ -285,6 +300,7 @@ describe('Subscription Transition Lifecycle and Plan Rule Gating', () => {
         },
       },
     });
+    createdSubIds.push(subExpiredQuot.id);
 
     await expectErrorCode(
       transitionSubscription({
@@ -309,6 +325,7 @@ describe('Subscription Transition Lifecycle and Plan Rule Gating', () => {
         createdById: staffUserId,
       },
     });
+    createdSubIds.push(sub.id);
 
     await expectErrorCode(
       transitionSubscription({
@@ -333,6 +350,7 @@ describe('Subscription Transition Lifecycle and Plan Rule Gating', () => {
         createdById: staffUserId,
       },
     });
+    createdSubIds.push(sub.id);
 
     // Before expiry: EARLY_CLOSE blocked
     await expectErrorCode(
@@ -367,6 +385,7 @@ describe('Subscription Transition Lifecycle and Plan Rule Gating', () => {
         createdById: staffUserId,
       },
     });
+    createdSubIds.push(sub.id);
 
     // System closure (actorId null, billingRunId set)
     await expectErrorCode(

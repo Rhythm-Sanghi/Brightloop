@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { prisma } from '../../lib/db/prisma';
 import { parseBusinessDate } from '../../lib/dates/business-date';
 import { runBilling } from '../../lib/services/billing/run';
@@ -7,6 +7,7 @@ import { Prisma } from '@prisma/client';
 import Decimal from 'decimal.js';
 
 describe('Milestone M4: Billing Engine & Numbering Integration Tests', () => {
+  const createdSubIds: string[] = [];
   let testUserId: string;
   let tax18Id: string;
   let prodStandardId: string;
@@ -79,13 +80,24 @@ describe('Milestone M4: Billing Engine & Numbering Integration Tests', () => {
     customerId = customer.id;
   });
 
+  afterEach(async () => {
+    if (createdSubIds.length === 0) return;
+    const ids = [...createdSubIds];
+    // Cleanup must close every owned subscription. Errors are not swallowed.
+    await prisma.subscription.updateMany({
+      where: { id: { in: ids } },
+      data: { status: 'CLOSED' },
+    });
+    createdSubIds.length = 0;
+  });
+
   // Helper to create an active subscription with lines
   async function createSub(planId: string, startDateStr: string, options?: { nextBillingDateStr?: string; expiryDateStr?: string }) {
     const startDate = parseBusinessDate(startDateStr);
     const nextBillingDate = options?.nextBillingDateStr ? parseBusinessDate(options.nextBillingDateStr) : startDate;
     const expiryDate = options?.expiryDateStr ? parseBusinessDate(options.expiryDateStr) : null;
 
-    return prisma.subscription.create({
+    const sub = await prisma.subscription.create({
       data: {
         customerId,
         planId,
@@ -109,6 +121,8 @@ describe('Milestone M4: Billing Engine & Numbering Integration Tests', () => {
       },
       include: { lines: true, plan: true },
     });
+    createdSubIds.push(sub.id);
+    return sub;
   }
 
   // -------------------------------------------------------------

@@ -5,6 +5,7 @@ import { todayBusinessDate } from '../../dates/business-date';
 import { claimNext } from './claim';
 import { processSubscription } from './subscription';
 import { eligibleDueSqlCondition } from './eligibility';
+import { countRemainingDuePeriods } from './remaining';
 import { createAuditLog } from '../audit';
 import { BillingRunStatus } from '../../constants';
 import { BillingTestOptions } from './period';
@@ -18,13 +19,16 @@ export async function runBilling(
   startedById: string,
   options?: {
     runDate?: Date;
+    asOfDate?: Date;
+    auditAt?: Date;
     maxPeriods?: number;
     hooks?: BillingRunHooks;
     testOptions?: BillingTestOptions;
     excludeSubscriptionIds?: string[];
   }
 ) {
-  const runDate = options?.runDate || todayBusinessDate();
+  const runDate = options?.asOfDate || options?.runDate || todayBusinessDate();
+  const auditAt = options?.auditAt || options?.asOfDate;
   const maxPeriods = options?.maxPeriods ?? BILLING_MAX_PERIODS_PER_SUBSCRIPTION;
   const hooks = options?.hooks;
   const testOptions = options?.testOptions;
@@ -36,6 +40,7 @@ export async function runBilling(
       status: 'RUNNING',
       maxPeriodsPerSubscription: maxPeriods,
       startedById,
+      ...(auditAt ? { startedAt: auditAt } : {}),
     },
   });
 
@@ -46,6 +51,7 @@ export async function runBilling(
     entityId: billingRun.id,
     fromStatus: null,
     toStatus: 'RUNNING',
+    auditAt,
   });
 
   const handled = new Set<string>();
@@ -61,7 +67,7 @@ export async function runBilling(
       const claimed = await claimNext(runDate, cursor, excluded);
       if (!claimed) break;
       handled.add(claimed);
-      await processSubscription(claimed, billingRun.id, runDate, maxPeriods, testOptions);
+      await processSubscription(claimed, billingRun.id, runDate, maxPeriods, testOptions, auditAt);
       cursor = claimed;
     }
   };
@@ -107,15 +113,44 @@ export async function runBilling(
     }
 
     // Step 4: Finalize
-    // Count pending eligible due subscriptions now (no exclusions)
-    const condition = eligibleDueSqlCondition(runDate);
-    const pendingRows = await prisma.$queryRaw<{ count: bigint }[]>(Prisma.sql`
-      SELECT COUNT(*)::bigint AS count
-      FROM "Subscription" s
-      JOIN "Plan" p ON p."id" = s."planId"
-      WHERE ${condition}
-    `);
-    const pending = Number(pendingRows[0]?.count || 0);
+    // Compute the complete eligible set at runDate: ACTIVE subscriptions where
+    // nextBillingDate <= runDate OR (expiryDate IS NOT NULL AND expiryDate <= runDate)
+    const eligibleSubs = await prisma.subscription.findMany({
+      where: {
+        status: 'ACTIVE',
+        OR: [
+          { nextBillingDate: { lte: runDate } },
+          { expiryDate: { not: null, lte: runDate } },
+        ],
+      },
+      include: { plan: true },
+    });
+
+    let subscriptionsAwaitingInvoiceGeneration = 0;
+    let subscriptionsAwaitingExpiryClosure = 0;
+    let subscriptionsAwaitingManualExpiryClosure = 0;
+
+    for (const sub of eligibleSubs) {
+      const remResult = countRemainingDuePeriods(
+        sub.startDate,
+        sub.plan.billingPeriod,
+        sub.plan.billingInterval,
+        sub.billingCycleIndex,
+        runDate,
+        sub.expiryDate
+      );
+      if (remResult.remainingDuePeriods > 0) {
+        subscriptionsAwaitingInvoiceGeneration++;
+      } else if (sub.expiryDate && sub.expiryDate <= runDate) {
+        if (sub.plan.autoCloseOnExpiry) {
+          subscriptionsAwaitingExpiryClosure++;
+        } else {
+          subscriptionsAwaitingManualExpiryClosure++;
+        }
+      }
+    }
+
+    const pending = subscriptionsAwaitingInvoiceGeneration + subscriptionsAwaitingExpiryClosure;
 
     // Derive counters from this run's BILLING_OUTCOME audit rows
     const outcomeRows = await prisma.auditLog.findMany({
@@ -162,57 +197,77 @@ export async function runBilling(
     const finalStatus: BillingRunStatus =
       pending === 0 ? 'COMPLETED' : 'COMPLETED_WITH_PENDING';
 
-    const updatedRun = await prisma.billingRun.update({
-      where: { id: billingRun.id },
-      data: {
-        status: finalStatus,
-        invoicesGenerated,
-        subscriptionsFullyProcessed,
-        subscriptionsPartiallyProcessed,
-        subscriptionsSkipped,
-        subscriptionsFailed,
-        subscriptionsPending: pending,
-        finishedAt: new Date(),
-      },
-    });
+    const updatedRun = await prisma.$transaction(async (tx) => {
+      const run = await tx.billingRun.update({
+        where: { id: billingRun.id },
+        data: {
+          status: finalStatus,
+          invoicesGenerated,
+          subscriptionsFullyProcessed,
+          subscriptionsPartiallyProcessed,
+          subscriptionsSkipped,
+          subscriptionsFailed,
+          subscriptionsPending: pending,
+          finishedAt: auditAt || new Date(),
+        },
+      });
 
-    await createAuditLog({
-      billingRunId: billingRun.id,
-      action: 'BILLING_RUN_SUMMARY',
-      entityType: 'BillingRun',
-      entityId: billingRun.id,
-      fromStatus: 'RUNNING',
-      toStatus: finalStatus,
-      metadata: {
-        finalStatus,
-        invoicesGenerated,
-        subscriptionsFullyProcessed,
-        subscriptionsPartiallyProcessed,
-        subscriptionsSkipped,
-        subscriptionsFailed,
-        subscriptionsPending: pending,
-      },
+      await createAuditLog(
+        {
+          billingRunId: billingRun.id,
+          action: 'BILLING_RUN_SUMMARY',
+          entityType: 'BillingRun',
+          entityId: billingRun.id,
+          fromStatus: 'RUNNING',
+          toStatus: finalStatus,
+          metadata: {
+            finalStatus,
+            invoicesGenerated,
+            subscriptionsFullyProcessed,
+            subscriptionsPartiallyProcessed,
+            subscriptionsSkipped,
+            subscriptionsFailed,
+            subscriptionsPending: pending,
+            subscriptionsAwaitingInvoiceGeneration,
+            subscriptionsAwaitingExpiryClosure,
+            subscriptionsAwaitingManualExpiryClosure,
+          },
+          auditAt,
+        },
+        tx
+      );
+
+      return run;
     });
 
     return updatedRun;
   } catch (error) {
     console.error('Billing run failed:', error);
     try {
-      await prisma.billingRun.update({
-        where: { id: billingRun.id },
-        data: {
-          status: 'FAILED',
-          finishedAt: new Date(),
-        },
-      });
+      await prisma.$transaction(async (tx) => {
+        await tx.billingRun.update({
+          where: { id: billingRun.id },
+          data: {
+            status: 'FAILED',
+            finishedAt: auditAt || new Date(),
+          },
+        });
 
-      await createAuditLog({
-        billingRunId: billingRun.id,
-        action: 'BILLING_RUN_FAILED',
-        entityType: 'BillingRun',
-        entityId: billingRun.id,
-        fromStatus: 'RUNNING',
-        toStatus: 'FAILED',
+        await createAuditLog(
+          {
+            billingRunId: billingRun.id,
+            action: 'BILLING_RUN_FAILED',
+            entityType: 'BillingRun',
+            entityId: billingRun.id,
+            fromStatus: 'RUNNING',
+            toStatus: 'FAILED',
+            metadata: {
+              error: error instanceof Error ? error.message : String(error),
+            },
+            auditAt,
+          },
+          tx
+        );
       });
     } catch {
       // Ignore if DB cannot write

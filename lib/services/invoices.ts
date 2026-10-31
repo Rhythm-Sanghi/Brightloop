@@ -6,7 +6,11 @@ import { createAuditLog } from './audit';
 import { queueSimulatedEmail } from './outbox';
 import { toDecimal } from '../money';
 
-export async function confirmInvoice(invoiceId: string, actorId?: string | null) {
+export async function confirmInvoice(
+  invoiceId: string,
+  actorId?: string | null,
+  options?: { asOfDate?: Date; auditAt?: Date }
+) {
   return prisma.$transaction(async (tx) => {
     // 1. SELECT ... FOR UPDATE
     const rows = await tx.$queryRaw<
@@ -42,12 +46,13 @@ export async function confirmInvoice(invoiceId: string, actorId?: string | null)
     const toStatus = isZeroTotal ? 'PAID' : 'CONFIRMED';
     const amountPaid = isZeroTotal ? '0.00' : undefined;
 
+    const confirmedAt = options?.asOfDate || options?.auditAt || new Date();
     const updated = await tx.invoice.update({
       where: { id: inv.id },
       data: {
         number: invoiceNumber,
         status: toStatus,
-        confirmedAt: new Date(),
+        confirmedAt,
         ...(amountPaid !== undefined ? { amountPaid } : {}),
       },
     });
@@ -62,6 +67,7 @@ export async function confirmInvoice(invoiceId: string, actorId?: string | null)
         fromStatus: 'DRAFT',
         toStatus,
         metadata: { invoiceNumber, isZeroTotal },
+        auditAt: options?.auditAt || options?.asOfDate,
       },
       tx
     );
@@ -73,7 +79,8 @@ export async function confirmInvoice(invoiceId: string, actorId?: string | null)
 export async function cancelInvoice(
   invoiceId: string,
   actorId?: string | null,
-  closeReason?: string | null
+  closeReason?: string | null,
+  options?: { asOfDate?: Date; auditAt?: Date }
 ) {
   return prisma.$transaction(async (tx) => {
     // Lock invoice row first (section 5.7)
@@ -105,11 +112,12 @@ export async function cancelInvoice(
     }
 
     // Set cancelledAt and status CANCELLED
+    const cancelledAt = options?.asOfDate || options?.auditAt || new Date();
     const updated = await tx.invoice.update({
       where: { id: inv.id },
       data: {
         status: 'CANCELLED',
-        cancelledAt: new Date(),
+        cancelledAt,
       },
     });
 
@@ -119,11 +127,31 @@ export async function cancelInvoice(
     });
 
     for (const idisc of invoiceDiscounts) {
-      await tx.$executeRaw(Prisma.sql`
+      const affected = await tx.$executeRaw(Prisma.sql`
         UPDATE "Discount"
         SET "timesUsed" = "timesUsed" - 1
         WHERE "id" = ${idisc.discountId} AND "timesUsed" > 0
       `);
+
+      if (affected === 0) {
+        throw new AppError(
+          'DATA_INCONSISTENT',
+          `Ledger integrity failure: discount ${idisc.discountId} timesUsed was zero or missing on cancellation`,
+          422
+        );
+      }
+
+      await createAuditLog(
+        {
+          actorId: actorId ?? null,
+          action: 'DISCOUNT_USAGE_DECREMENTED',
+          entityType: 'Discount',
+          entityId: idisc.discountId,
+          metadata: { invoiceId: inv.id },
+          auditAt: options?.auditAt || options?.asOfDate,
+        },
+        tx
+      );
     }
 
     // Write audit row
@@ -136,6 +164,7 @@ export async function cancelInvoice(
         fromStatus: inv.status,
         toStatus: 'CANCELLED',
         metadata: { closeReason },
+        auditAt: options?.auditAt || options?.asOfDate,
       },
       tx
     );

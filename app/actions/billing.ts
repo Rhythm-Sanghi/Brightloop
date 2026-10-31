@@ -40,7 +40,7 @@ export async function getBillingRunDetailsAction(runId: string) {
         billingRunId: runId,
         action: 'BILLING_OUTCOME',
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: { seq: 'desc' },
     });
 
     const subscriptionIds = outcomes.map((o) => o.entityId);

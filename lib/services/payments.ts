@@ -14,10 +14,12 @@ export interface RecordPaymentInput {
   note?: string | null;
   recordedById: string;
   todayOverride?: Date;
+  asOfDate?: Date;
+  auditAt?: Date;
 }
 
 export async function recordPayment(input: RecordPaymentInput) {
-  const today = input.todayOverride || todayBusinessDate();
+  const today = input.asOfDate || input.todayOverride || todayBusinessDate();
   const paymentAmount = round2(toDecimal(input.amount));
 
   if (!paymentAmount.greaterThan(0)) {
@@ -90,6 +92,7 @@ export async function recordPayment(input: RecordPaymentInput) {
         paidOn: input.paidOn,
         note: input.note || null,
         recordedById: input.recordedById,
+        ...(input.auditAt || input.asOfDate ? { createdAt: input.auditAt || input.asOfDate } : {}),
       },
     });
 
@@ -120,6 +123,7 @@ export async function recordPayment(input: RecordPaymentInput) {
           newAmountPaid: newPaid.toFixed(2),
           invoiceStatus: toStatus,
         },
+        auditAt: input.auditAt || input.asOfDate,
       },
       tx
     );
@@ -134,6 +138,7 @@ export async function recordPayment(input: RecordPaymentInput) {
           fromStatus: 'CONFIRMED',
           toStatus: 'PAID',
           metadata: { total: invoiceTotal.toFixed(2) },
+          auditAt: input.auditAt || input.asOfDate,
         },
         tx
       );

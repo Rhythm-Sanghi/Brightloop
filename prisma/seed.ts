@@ -3,11 +3,153 @@ loadEnvConfig(process.cwd());
 
 import { prisma } from '../lib/db/prisma';
 import { hashPassword } from '../lib/auth/password';
-import { todayBusinessDate, addDays, addUnits, parseBusinessDate } from '../lib/dates/business-date';
-import { reserveSubscriptionNumber, reserveInvoiceNumber } from '../lib/services/numbering';
-import { calculateInvoiceTotals, RawInvoiceLineInput } from '../lib/calculations/invoice';
+import { todayBusinessDate, addDays, addUnits } from '../lib/dates/business-date';
+import { transitionSubscriptionTx } from '../lib/services/subscriptions/transition';
 import { runBilling } from '../lib/services/billing/run';
+import { confirmInvoice, cancelInvoice, sendInvoiceToOutbox } from '../lib/services/invoices';
+import { recordPayment } from '../lib/services/payments';
+import { assignSubscriptionDiscount } from '../lib/services/discounts';
+import { createSubscriptionRequest } from '../lib/services/requests';
+import { requestPasswordReset } from '../lib/services/auth';
+import { createAuditLog } from '../lib/services/audit';
 import Decimal from 'decimal.js';
+
+interface SeedSubConfig {
+  id: string;
+  customerId: string;
+  planId: string;
+  targetStatus: 'DRAFT' | 'QUOTATION' | 'CONFIRMED' | 'ACTIVE' | 'PAUSED' | 'CLOSED';
+  startDate: Date;
+  expiryDate?: Date;
+  paymentTermsDays?: number;
+  quotationValidUntil?: Date;
+  lines: Array<{
+    productId: string;
+    variantId?: string | null;
+    quantity: number;
+    unitPrice: Decimal;
+    taxId?: string | null;
+  }>;
+  pauseDate?: Date;
+  closeDate?: Date;
+  closeReason?: string;
+}
+
+async function createLifecycleSubscription(
+  cfg: SeedSubConfig,
+  actorId: string
+) {
+  return prisma.$transaction(async (tx) => {
+    // 1. Create in DRAFT status
+    const sub = await tx.subscription.create({
+      data: {
+        id: cfg.id,
+        customerId: cfg.customerId,
+        planId: cfg.planId,
+        status: 'DRAFT',
+        startDate: cfg.startDate,
+        expiryDate: cfg.expiryDate || addUnits(cfg.startDate, 'YEARLY', 1, 1),
+        paymentTermsDays: cfg.paymentTermsDays ?? 15,
+        createdById: actorId,
+        createdAt: cfg.startDate,
+        lines: {
+          create: cfg.lines.map((l) => ({
+            productId: l.productId,
+            variantId: l.variantId || null,
+            quantity: l.quantity,
+            unitPrice: l.unitPrice,
+            taxId: l.taxId || null,
+          })),
+        },
+      },
+    });
+
+    await createAuditLog(
+      {
+        actorId,
+        action: 'STATUS_CHANGE',
+        entityType: 'Subscription',
+        entityId: sub.id,
+        fromStatus: null,
+        toStatus: 'DRAFT',
+        auditAt: cfg.startDate,
+      },
+      tx
+    );
+
+    if (cfg.targetStatus === 'DRAFT') {
+      return sub;
+    }
+
+    // 2. Transition SEND_QUOTATION -> QUOTATION
+    await transitionSubscriptionTx(tx, {
+      subscriptionId: sub.id,
+      action: 'SEND_QUOTATION',
+      actorId,
+      asOfDate: cfg.startDate,
+      auditAt: cfg.startDate,
+    });
+
+    if (cfg.targetStatus === 'QUOTATION') {
+      return sub;
+    }
+
+    // 3. Transition CONFIRM_QUOTATION -> CONFIRMED (assigns subscription number)
+    await transitionSubscriptionTx(tx, {
+      subscriptionId: sub.id,
+      action: 'CONFIRM_QUOTATION',
+      actorId,
+      asOfDate: cfg.startDate,
+      auditAt: cfg.startDate,
+    });
+
+    if (cfg.targetStatus === 'CONFIRMED') {
+      return sub;
+    }
+
+    // 4. Transition ACTIVATE -> ACTIVE
+    await transitionSubscriptionTx(tx, {
+      subscriptionId: sub.id,
+      action: 'ACTIVATE',
+      actorId,
+      asOfDate: cfg.startDate,
+      auditAt: cfg.startDate,
+    });
+
+    if (cfg.targetStatus === 'ACTIVE') {
+      return sub;
+    }
+
+    // 5. If PAUSED
+    if (cfg.targetStatus === 'PAUSED') {
+      const pauseDate = cfg.pauseDate || addDays(cfg.startDate, 10);
+      await transitionSubscriptionTx(tx, {
+        subscriptionId: sub.id,
+        action: 'PAUSE',
+        actorId,
+        asOfDate: pauseDate,
+        auditAt: pauseDate,
+      });
+      return sub;
+    }
+
+    // 6. If CLOSED
+    if (cfg.targetStatus === 'CLOSED') {
+      const closeDate = cfg.closeDate || addDays(cfg.startDate, 20);
+      await transitionSubscriptionTx(tx, {
+        subscriptionId: sub.id,
+        action: 'EARLY_CLOSE',
+        actorId,
+        asOfDate: closeDate,
+        auditAt: closeDate,
+        closeReason: cfg.closeReason || 'Customer requested early close',
+      });
+      return sub;
+    }
+
+    return sub;
+  });
+}
 
 async function main() {
   if (process.env.NODE_ENV === 'production') {
@@ -50,7 +192,9 @@ async function main() {
   const today = todayBusinessDate();
   const demoPasswordHash = await hashPassword('Demo@12345');
 
+  // ==========================================
   // 1. Reference Data: Taxes
+  // ==========================================
   const tax18 = await prisma.tax.upsert({
     where: { id: 'tax_gst_18' },
     update: {},
@@ -73,7 +217,9 @@ async function main() {
     },
   });
 
+  // ==========================================
   // 2. Reference Data: Products & Variants
+  // ==========================================
   const prodSuite = await prisma.product.upsert({
     where: { id: 'prod_brightloop_suite' },
     update: {},
@@ -131,7 +277,7 @@ async function main() {
     },
   });
 
-  // Variants (3 variants, including Brand: Odoo with adjustment 560)
+  // Variants (including Brand: Odoo with adjustment 560: 1000 + 560 = 1560)
   const variantOdoo = await prisma.productVariant.upsert({
     where: {
       productId_attribute_value: {
@@ -146,7 +292,7 @@ async function main() {
       productId: prodSuite.id,
       attribute: 'Brand',
       value: 'Odoo',
-      priceAdjustment: new Decimal('560.00'), // 1000 + 560 = 1560
+      priceAdjustment: new Decimal('560.00'),
       isActive: true,
     },
   });
@@ -189,7 +335,9 @@ async function main() {
     },
   });
 
-  // 3. Plans (4 plans: DAILY, WEEKLY, MONTHLY, YEARLY)
+  // ==========================================
+  // 3. Reference Data: Plans
+  // ==========================================
   const planDaily = await prisma.plan.upsert({
     where: { id: 'plan_daily' },
     update: {},
@@ -219,7 +367,7 @@ async function main() {
       billingInterval: 1,
       minimumQuantity: 1,
       availableFrom: addDays(today, -365),
-      paymentTermsDays: 10,
+      paymentTermsDays: 7,
       autoCloseOnExpiry: true,
       allowEarlyClose: true,
       allowPause: true,
@@ -266,8 +414,10 @@ async function main() {
     },
   });
 
-  // 4. Quotation Templates (2 templates)
-  const templateStandard = await prisma.quotationTemplate.upsert({
+  // ==========================================
+  // 4. Quotation Templates
+  // ==========================================
+  await prisma.quotationTemplate.upsert({
     where: { id: 'tmpl_standard' },
     update: {},
     create: {
@@ -314,8 +464,10 @@ async function main() {
     },
   });
 
-  // 5. Discounts (2 discounts: 1 FIXED product-scoped maxUses 5, 1 PERCENT subscription-scoped maxUses 1)
-  const discFixed = await prisma.discount.upsert({
+  // ==========================================
+  // 5. Reference Data: Discounts
+  // ==========================================
+  await prisma.discount.upsert({
     where: { id: 'disc_fixed_product' },
     update: {},
     create: {
@@ -352,7 +504,9 @@ async function main() {
     },
   });
 
-  // 6. Customers (12 customers, acme@corp.demo has no User account)
+  // ==========================================
+  // 6. Customers & Users
+  // ==========================================
   const customerRecords: Array<{ id: string; email: string }> = [];
   for (let i = 1; i <= 12; i++) {
     const isAcme = i === 1;
@@ -373,7 +527,6 @@ async function main() {
     customerRecords.push(cust);
   }
 
-  // 7. Users: Demo accounts (local development only)
   const adminUser = await prisma.user.upsert({
     where: { email: 'admin@brightloop.demo' },
     update: {},
@@ -403,7 +556,7 @@ async function main() {
   });
 
   const primaryCustomer = customerRecords[1]; // customer2@brightloop.demo
-  const demoCustomerUser = await prisma.user.upsert({
+  await prisma.user.upsert({
     where: { email: 'customer@brightloop.demo' },
     update: {},
     create: {
@@ -418,327 +571,423 @@ async function main() {
     },
   });
 
-  // 8. Subscriptions (15 subscriptions across statuses)
-  // Two catch-up demonstration subscriptions:
-  // - "Migrated monthly subscription": MONTHLY plan, startDate 3 months before today on anchor
-  const migratedMonthlyStart = addUnits(today, 'MONTHLY', 1, -3);
-  const migratedMonthly = await prisma.$transaction(async (tx) => {
-    const subNum = await reserveSubscriptionNumber(tx);
-    return tx.subscription.create({
-      data: {
-        id: 'sub_migrated_monthly',
-        number: subNum,
-        customerId: primaryCustomer.id,
-        planId: planMonthly.id,
-        status: 'ACTIVE',
-        startDate: migratedMonthlyStart,
-        expiryDate: addUnits(migratedMonthlyStart, 'YEARLY', 1, 2), // Far future
-        nextBillingDate: migratedMonthlyStart,
-        billingCycleIndex: 0,
-        paymentTermsDays: 15,
-        createdById: staffUser.id,
-        lines: {
-          create: [
-            {
-              productId: prodSuite.id,
-              variantId: variantOdoo.id,
-              quantity: 1,
-              unitPrice: new Decimal('1560.00'),
-              taxId: tax18.id,
-            },
-          ],
-        },
-      },
-    });
-  });
+  // ==========================================
+  // 7. Subscriptions: Real Lifecycle Transitions
+  // ==========================================
+  console.log('Creating subscriptions through lifecycle transitions...');
 
-  // Assign VIP 10% discount to migrated monthly subscription
-  await prisma.subscriptionDiscount.create({
-    data: {
-      subscriptionId: migratedMonthly.id,
-      discountId: discPercent.id,
+  const demoSubsConfig: SeedSubConfig[] = [
+    // DRAFT subscriptions
+    {
+      id: 'sub_draft_1',
+      customerId: customerRecords[0].id,
+      planId: planMonthly.id,
+      targetStatus: 'DRAFT',
+      startDate: today,
+      lines: [
+        { productId: prodSuite.id, variantId: variantOdoo.id, quantity: 1, unitPrice: new Decimal('1560.00'), taxId: tax18.id },
+      ],
     },
-  });
+    {
+      id: 'sub_draft_2',
+      customerId: customerRecords[3].id,
+      planId: planWeekly.id,
+      targetStatus: 'DRAFT',
+      startDate: today,
+      lines: [
+        { productId: prodStorage.id, quantity: 2, unitPrice: new Decimal('200.00'), taxId: tax12.id },
+      ],
+    },
 
-  // - "Migrated daily subscription": DAILY plan, startDate 14 days before today
-  const migratedDailyStart = addDays(today, -14);
-  const migratedDaily = await prisma.$transaction(async (tx) => {
-    const subNum = await reserveSubscriptionNumber(tx);
-    return tx.subscription.create({
-      data: {
-        id: 'sub_migrated_daily',
-        number: subNum,
-        customerId: customerRecords[2].id,
-        planId: planDaily.id,
-        status: 'ACTIVE',
-        startDate: migratedDailyStart,
-        expiryDate: addDays(migratedDailyStart, 100), // Far future
-        nextBillingDate: migratedDailyStart,
-        billingCycleIndex: 0,
-        paymentTermsDays: 7,
-        createdById: staffUser.id,
-        lines: {
-          create: [
-            {
-              productId: prodStorage.id,
-              quantity: 5,
-              unitPrice: new Decimal('200.00'),
-              taxId: tax12.id,
-            },
-          ],
-        },
-      },
-    });
-  });
+    // QUOTATION subscriptions
+    {
+      id: 'sub_quot_1',
+      customerId: customerRecords[4].id,
+      planId: planMonthly.id,
+      targetStatus: 'QUOTATION',
+      startDate: today,
+      lines: [
+        { productId: prodSuite.id, quantity: 1, unitPrice: new Decimal('1000.00'), taxId: tax18.id },
+      ],
+    },
+    {
+      id: 'sub_quot_2',
+      customerId: customerRecords[5].id,
+      planId: planYearly.id,
+      targetStatus: 'QUOTATION',
+      startDate: today,
+      lines: [
+        { productId: prodStorage.id, quantity: 5, unitPrice: new Decimal('200.00'), taxId: tax12.id },
+      ],
+    },
 
-  // Create additional subscriptions (across DRAFT, QUOTATION, CONFIRMED, ACTIVE, PAUSED, CLOSED)
-  const otherSubsConfig = [
-    { id: 'sub_draft_1', status: 'DRAFT', plan: planMonthly, cust: customerRecords[0], start: today, exp: addUnits(today, 'YEARLY', 1, 1) },
-    { id: 'sub_draft_2', status: 'DRAFT', plan: planWeekly, cust: customerRecords[3], start: today, exp: addUnits(today, 'MONTHLY', 1, 6) },
-    { id: 'sub_quot_1', status: 'QUOTATION', plan: planMonthly, cust: customerRecords[4], start: today, exp: addUnits(today, 'YEARLY', 1, 1), validUntil: addDays(today, 20) },
-    { id: 'sub_quot_2', status: 'QUOTATION', plan: planYearly, cust: customerRecords[5], start: today, exp: addUnits(today, 'YEARLY', 1, 2), validUntil: addDays(today, 25) },
-    { id: 'sub_conf_1', status: 'CONFIRMED', plan: planMonthly, cust: customerRecords[6], start: today, exp: addUnits(today, 'YEARLY', 1, 1) },
-    { id: 'sub_conf_2', status: 'CONFIRMED', plan: planWeekly, cust: customerRecords[7], start: today, exp: addUnits(today, 'MONTHLY', 1, 3) },
-    { id: 'sub_act_1', status: 'ACTIVE', plan: planMonthly, cust: customerRecords[8], start: addUnits(today, 'YEARLY', 1, -1), exp: addUnits(today, 'YEARLY', 1, 1) },
-    { id: 'sub_act_2', status: 'ACTIVE', plan: planWeekly, cust: customerRecords[9], start: addDays(today, -60), exp: addUnits(today, 'MONTHLY', 1, 6) },
-    { id: 'sub_paused_1', status: 'PAUSED', plan: planMonthly, cust: primaryCustomer, start: addUnits(today, 'MONTHLY', 1, -4), exp: addUnits(today, 'YEARLY', 1, 1), pausedAt: addDays(today, -5) },
-    { id: 'sub_paused_2', status: 'PAUSED', plan: planWeekly, cust: customerRecords[10], start: addDays(today, -45), exp: addUnits(today, 'MONTHLY', 1, 6), pausedAt: addDays(today, -3) },
-    { id: 'sub_closed_1', status: 'CLOSED', plan: planMonthly, cust: customerRecords[11], start: addUnits(today, 'YEARLY', 1, -1), exp: addDays(today, -10), closedAt: addDays(today, -10), closeReason: 'EXPIRED' },
-    { id: 'sub_closed_2', status: 'CLOSED', plan: planMonthly, cust: customerRecords[2], start: addUnits(today, 'MONTHLY', 1, -5), exp: addUnits(today, 'MONTHLY', 1, 7), closedAt: addDays(today, -2), closeReason: 'Customer requested cancellation' },
-    { id: 'sub_act_expiring', status: 'ACTIVE', plan: planMonthly, cust: customerRecords[3], start: addUnits(today, 'YEARLY', 1, -1), exp: addDays(today, 15) }, // Upcoming renewal (next 30 days)
+    // CONFIRMED subscriptions
+    {
+      id: 'sub_conf_1',
+      customerId: customerRecords[6].id,
+      planId: planMonthly.id,
+      targetStatus: 'CONFIRMED',
+      startDate: today,
+      lines: [
+        { productId: prodSuite.id, variantId: variantOdoo.id, quantity: 1, unitPrice: new Decimal('1560.00'), taxId: tax18.id },
+      ],
+    },
+    {
+      id: 'sub_conf_2',
+      customerId: customerRecords[7].id,
+      planId: planWeekly.id,
+      targetStatus: 'CONFIRMED',
+      startDate: today,
+      lines: [
+        { productId: prodAnalytics.id, quantity: 1, unitPrice: new Decimal('500.00'), taxId: tax18.id },
+      ],
+    },
+
+    // ACTIVE subscriptions with past start dates so historical runs bill them
+    {
+      id: 'sub_act_1',
+      customerId: customerRecords[8].id,
+      planId: planMonthly.id,
+      targetStatus: 'ACTIVE',
+      startDate: addDays(today, -60),
+      lines: [
+        { productId: prodSuite.id, variantId: variantOdoo.id, quantity: 1, unitPrice: new Decimal('1560.00'), taxId: tax18.id },
+        { productId: prodSupport.id, quantity: 1, unitPrice: new Decimal('800.00'), taxId: tax18.id },
+      ],
+    },
+    {
+      id: 'sub_act_2',
+      customerId: customerRecords[9].id,
+      planId: planWeekly.id,
+      targetStatus: 'ACTIVE',
+      startDate: addDays(today, -45),
+      lines: [
+        { productId: prodSuite.id, quantity: 1, unitPrice: new Decimal('1000.00'), taxId: tax18.id },
+      ],
+    },
+    {
+      id: 'sub_act_3',
+      customerId: customerRecords[10].id,
+      planId: planDaily.id,
+      targetStatus: 'ACTIVE',
+      startDate: addDays(today, -14),
+      lines: [
+        { productId: prodStorage.id, quantity: 3, unitPrice: new Decimal('200.00'), taxId: tax12.id },
+      ],
+    },
+    {
+      id: 'sub_act_expiring',
+      customerId: customerRecords[3].id,
+      planId: planYearly.id,
+      targetStatus: 'ACTIVE',
+      startDate: addDays(today, -365),
+      expiryDate: addDays(today, 15),
+      lines: [
+        { productId: prodSuite.id, quantity: 1, unitPrice: new Decimal('1000.00'), taxId: tax18.id },
+      ],
+    },
+
+    // PAUSED subscription
+    {
+      id: 'sub_paused_1',
+      customerId: primaryCustomer.id,
+      planId: planWeekly.id,
+      targetStatus: 'PAUSED',
+      startDate: addDays(today, -45),
+      pauseDate: addDays(today, -5),
+      lines: [
+        { productId: prodAnalytics.id, quantity: 1, unitPrice: new Decimal('500.00'), taxId: tax18.id },
+      ],
+    },
+
+    // CLOSED subscriptions
+    {
+      id: 'sub_closed_1',
+      customerId: customerRecords[11].id,
+      planId: planWeekly.id,
+      targetStatus: 'CLOSED',
+      startDate: addDays(today, -60),
+      closeDate: addDays(today, -10),
+      closeReason: 'Customer requested early close',
+      lines: [
+        { productId: prodStorage.id, quantity: 1, unitPrice: new Decimal('200.00'), taxId: tax12.id },
+      ],
+    },
+    {
+      id: 'sub_closed_2',
+      customerId: customerRecords[2].id,
+      planId: planYearly.id,
+      targetStatus: 'CLOSED',
+      startDate: addDays(today, -150),
+      closeDate: addDays(today, -2),
+      closeReason: 'Corporate restructuring',
+      lines: [
+        { productId: prodSuite.id, quantity: 1, unitPrice: new Decimal('1000.00'), taxId: tax18.id },
+      ],
+    },
   ];
 
-  const createdSubs: { id: string; customerId: string; startDate: Date }[] = [];
+  for (const cfg of demoSubsConfig) {
+    await createLifecycleSubscription(cfg, staffUser.id);
+  }
 
-  for (const cfg of otherSubsConfig) {
-    const sub = await prisma.$transaction(async (tx) => {
-      const needsNumber = cfg.status !== 'DRAFT' && cfg.status !== 'QUOTATION';
-      const number = needsNumber ? await reserveSubscriptionNumber(tx) : null;
-      return tx.subscription.create({
-        data: {
-          id: cfg.id,
-          number,
-          customerId: cfg.cust.id,
-          planId: cfg.plan.id,
-          status: cfg.status,
-          startDate: cfg.start,
-          expiryDate: cfg.exp,
-          nextBillingDate: cfg.status === 'ACTIVE' ? cfg.start : null,
-          billingCycleIndex: 0,
-          quotationValidUntil: cfg.validUntil || null,
-          paymentTermsDays: cfg.plan.paymentTermsDays,
-          pausedAt: cfg.pausedAt ? new Date(cfg.pausedAt) : null,
-          closedAt: cfg.closedAt ? new Date(cfg.closedAt) : null,
-          closeReason: cfg.closeReason || null,
-          createdById: staffUser.id,
-          lines: {
-            create: [
-              {
-                productId: prodSuite.id,
-                quantity: 1,
-                unitPrice: new Decimal('1000.00'),
-                taxId: tax18.id,
-              },
+  // ==========================================
+  // 8. Assign SUBSCRIPTION-scoped Discount
+  // ==========================================
+  console.log('Assigning subscription discount...');
+  await assignSubscriptionDiscount(
+    'sub_act_1',
+    discPercent.id,
+    staffUser.id,
+    addDays(today, -60)
+  );
+
+  // ==========================================
+  // 9. Historical Billing Runs (-60, -30, -7 days)
+  // ==========================================
+  console.log('Executing historical billing runs...');
+  await runBilling(staffUser.id, {
+    asOfDate: addDays(today, -60),
+    auditAt: addDays(today, -60),
+  });
+
+  await runBilling(staffUser.id, {
+    asOfDate: addDays(today, -30),
+    auditAt: addDays(today, -30),
+  });
+
+  await runBilling(staffUser.id, {
+    asOfDate: addDays(today, -7),
+    auditAt: addDays(today, -7),
+  });
+
+  // ==========================================
+  // 10. Confirm a subset of Generated Invoices
+  // ==========================================
+  console.log('Confirming subset of historical invoices...');
+  const allDraftInvoices = await prisma.invoice.findMany({
+    where: { status: 'DRAFT' },
+    orderBy: { issueDate: 'asc' },
+  });
+
+  // Confirm the first 7 invoices; leave remaining as DRAFT
+  const invoicesToConfirm = allDraftInvoices.slice(0, 7);
+  for (const inv of invoicesToConfirm) {
+    await confirmInvoice(inv.id, staffUser.id, {
+      asOfDate: inv.issueDate,
+      auditAt: inv.issueDate,
+    });
+  }
+
+  // ==========================================
+  // 11. Payments via recordPayment Service
+  // ==========================================
+  console.log('Recording payments across PAYMENT_METHODS...');
+  const confirmedInvoices = await prisma.invoice.findMany({
+    where: { status: 'CONFIRMED' },
+    orderBy: { issueDate: 'asc' },
+  });
+
+  // 1. Partial payment with BANK_TRANSFER
+  await recordPayment({
+    invoiceId: confirmedInvoices[0].id,
+    amount: '200.00',
+    method: 'BANK_TRANSFER',
+    paidOn: confirmedInvoices[0].issueDate,
+    note: 'Initial bank transfer',
+    recordedById: staffUser.id,
+    asOfDate: confirmedInvoices[0].issueDate,
+    auditAt: confirmedInvoices[0].issueDate,
+  });
+
+  // 2. Partial payment with UPI
+  await recordPayment({
+    invoiceId: confirmedInvoices[1].id,
+    amount: '300.00',
+    method: 'UPI',
+    paidOn: confirmedInvoices[1].issueDate,
+    note: 'UPI QR scan partial payment',
+    recordedById: staffUser.id,
+    asOfDate: confirmedInvoices[1].issueDate,
+    auditAt: confirmedInvoices[1].issueDate,
+  });
+
+  // 3. Cheque payment (partial/advance)
+  await recordPayment({
+    invoiceId: confirmedInvoices[4].id,
+    amount: '150.00',
+    method: 'CHEQUE',
+    paidOn: confirmedInvoices[4].issueDate,
+    note: 'Cheque deposit verified',
+    recordedById: staffUser.id,
+    asOfDate: confirmedInvoices[4].issueDate,
+    auditAt: confirmedInvoices[4].issueDate,
+  });
+
+  // 4. Full payment with CASH -> sets invoice status to PAID
+  await recordPayment({
+    invoiceId: confirmedInvoices[5].id,
+    amount: confirmedInvoices[5].total.toString(),
+    method: 'CASH',
+    paidOn: confirmedInvoices[5].issueDate,
+    note: 'Full payment received in cash',
+    recordedById: staffUser.id,
+    asOfDate: confirmedInvoices[5].issueDate,
+    auditAt: confirmedInvoices[5].issueDate,
+  });
+
+  // Invoices confirmedInvoices[0], [1], [2], [3], [4] all have dueDate < CURRENT_DATE
+  // and positive remaining balance (total - amountPaid > 0), fulfilling the overdue check >= 4!
+
+  // ==========================================
+  // 12. Cancel One Confirmed Invoice (Discount Release)
+  // ==========================================
+  console.log('Cancelling confirmed invoice to test discount usage release...');
+  // Find an invoice that received the discount or cancel confirmedInvoices[6]
+  const invoiceWithDiscount = await prisma.invoice.findFirst({
+    where: {
+      status: 'CONFIRMED',
+      amountPaid: new Decimal(0),
+      discounts: { some: {} },
+    },
+  });
+
+  const invoiceToCancel = invoiceWithDiscount || confirmedInvoices[6];
+  await cancelInvoice(
+    invoiceToCancel.id,
+    staffUser.id,
+    'Customer cancelled prior to payment',
+    { asOfDate: invoiceToCancel.issueDate, auditAt: invoiceToCancel.issueDate }
+  );
+
+  // ==========================================
+  // 13. Migrated Subscriptions (Created after historical runs)
+  // ==========================================
+  console.log('Creating migrated subscriptions...');
+  // MONTHLY subscription starting 3 months before today
+  const migratedMonthlyStart = addUnits(today, 'MONTHLY', 1, -3);
+  const migratedMonthly = await createLifecycleSubscription(
+    {
+      id: 'sub_migrated_monthly',
+      customerId: primaryCustomer.id,
+      planId: planMonthly.id,
+      targetStatus: 'ACTIVE',
+      startDate: migratedMonthlyStart,
+      expiryDate: addUnits(migratedMonthlyStart, 'YEARLY', 1, 2),
+      paymentTermsDays: 15,
+      lines: [
+        { productId: prodSuite.id, variantId: variantOdoo.id, quantity: 1, unitPrice: new Decimal('1560.00'), taxId: tax18.id },
+      ],
+    },
+    staffUser.id
+  );
+
+  // Re-assign VIP 10% discount to migrated monthly subscription
+  await assignSubscriptionDiscount(
+    migratedMonthly.id,
+    discPercent.id,
+    staffUser.id,
+    today
+  );
+
+  // DAILY subscription starting 15 days before today (12 cap + 3 pending = 15 total due)
+  const migratedDailyStart = addDays(today, -15);
+  await createLifecycleSubscription(
+    {
+      id: 'sub_migrated_daily',
+      customerId: customerRecords[2].id,
+      planId: planDaily.id,
+      targetStatus: 'ACTIVE',
+      startDate: migratedDailyStart,
+      expiryDate: addDays(migratedDailyStart, 100),
+      paymentTermsDays: 7,
+      lines: [
+        { productId: prodStorage.id, quantity: 5, unitPrice: new Decimal('200.00'), taxId: tax12.id },
+      ],
+    },
+    staffUser.id
+  );
+
+  // ==========================================
+  // 14. Customer Requests (PAUSE & RENEW)
+  // ==========================================
+  console.log('Creating customer requests...');
+  await createSubscriptionRequest(
+    customerRecords[8].id,
+    'sub_act_1',
+    'PAUSE',
+    'Temporary pause during seasonal office relocation.'
+  );
+
+  await createSubscriptionRequest(
+    customerRecords[3].id,
+    'sub_act_expiring',
+    'RENEW',
+    'Renewing for another annual cycle.'
+  );
+
+  // ==========================================
+  // 15. Email Outbox via Real Services
+  // ==========================================
+  console.log('Creating email outbox entries...');
+  // Real password reset request
+  await requestPasswordReset('customer@brightloop.demo');
+
+  // Real invoice email send
+  await sendInvoiceToOutbox(confirmedInvoices[0].id, staffUser.id);
+
+  // ==========================================
+  // 16. Load Scale Branch (SEED_SCALE=load)
+  // ==========================================
+  if (requestedScale === 'load') {
+    console.log('Generating 2,000 subscriptions for load scale in chunks of 200...');
+    const totalLoadSubs = 2000;
+    const chunkSize = 200;
+    const numChunks = totalLoadSubs / chunkSize;
+
+    for (let c = 0; c < numChunks; c++) {
+      const chunkStart = c * chunkSize + 1;
+      const chunkEnd = (c + 1) * chunkSize;
+
+      for (let i = chunkStart; i <= chunkEnd; i++) {
+        const cust = customerRecords[(i - 1) % customerRecords.length];
+        const startDate = i <= 1000 ? addDays(today, -30) : addDays(today, -1);
+
+        await createLifecycleSubscription(
+          {
+            id: `sub_load_${i}`,
+            customerId: cust.id,
+            planId: planMonthly.id,
+            targetStatus: 'ACTIVE',
+            startDate,
+            expiryDate: addUnits(today, 'YEARLY', 1, 1),
+            paymentTermsDays: 15,
+            lines: [
+              { productId: prodSuite.id, quantity: 1, unitPrice: new Decimal('1000.00'), taxId: tax18.id },
             ],
           },
-        },
-      });
+          staffUser.id
+        );
+      }
+      console.log(`Load: chunk ${c + 1}/${numChunks} (${chunkEnd}/${totalLoadSubs} subscriptions created)...`);
+    }
+
+    console.log('Load: running historical billing pass at today - 30...');
+    await runBilling(staffUser.id, {
+      asOfDate: addDays(today, -30),
+      auditAt: addDays(today, -30),
     });
 
-    createdSubs.push({
-      id: sub.id,
-      customerId: sub.customerId,
-      startDate: sub.startDate,
-    });
-
-    // Write audit row with backdated createdAt consistent with dates
-    await prisma.auditLog.create({
-      data: {
-        actorId: staffUser.id,
-        action: 'STATUS_CHANGE',
-        entityType: 'Subscription',
-        entityId: cfg.id,
-        fromStatus: null,
-        toStatus: cfg.status,
-        createdAt: cfg.start,
-      },
+    console.log('Load: running historical billing pass at today - 1...');
+    await runBilling(staffUser.id, {
+      asOfDate: addDays(today, -1),
+      auditAt: addDays(today, -1),
     });
   }
 
-  // 9. Customer Requests (at least 2 pending: one PAUSE, one RENEW)
-  await prisma.subscriptionRequest.create({
-    data: {
-      id: 'req_pause_demo',
-      subscriptionId: 'sub_act_1',
-      customerId: customerRecords[8].id,
-      requestType: 'PAUSE',
-      status: 'PENDING',
-      customerNote: 'Temporary freeze during seasonal office relocation.',
-    },
-  });
-
-  await prisma.subscriptionRequest.create({
-    data: {
-      id: 'req_renew_demo',
-      subscriptionId: 'sub_act_expiring',
-      customerId: customerRecords[3].id,
-      requestType: 'RENEW',
-      status: 'PENDING',
-      customerNote: 'Renewing for another billing cycle.',
-    },
-  });
-
-  // 10. Seed 40 Invoices across statuses with payments & at least 4 overdue
-  // Numbers span 2025 and 2026
-  console.log('Generating seed invoices and payments...');
-  // We attach invoices to the created non-migrated subscriptions
-  // Ensure each subscriptionId has distinct periodStart dates
-  const subPeriodTracker = new Map<string, number>();
-
-  for (let i = 1; i <= 40; i++) {
-    await prisma.$transaction(async (tx) => {
-      const year = i <= 20 ? 2025 : 2026;
-      const invNum = await reserveInvoiceNumber(tx, year);
-
-      const targetSub = createdSubs[i % createdSubs.length];
-      const cycleIndex = subPeriodTracker.get(targetSub.id) || 0;
-      subPeriodTracker.set(targetSub.id, cycleIndex + 1);
-
-      const isOverdue = i <= 4;
-      const status = isOverdue
-        ? 'CONFIRMED'
-        : i % 4 === 0
-        ? 'PAID'
-        : i % 4 === 1
-        ? 'CONFIRMED'
-        : i % 4 === 2
-        ? 'DRAFT'
-        : 'CANCELLED';
-
-      // Anchor period starts uniquely per subscription
-      const periodStart = addUnits(targetSub.startDate, 'MONTHLY', 1, cycleIndex);
-      const periodEnd = addDays(addUnits(targetSub.startDate, 'MONTHLY', 1, cycleIndex + 1), -1);
-
-      // Overdue invoices: dueDate strictly before today (2026-10-31)
-      const issueDate = isOverdue
-        ? parseBusinessDate('2026-08-01')
-        : periodStart;
-      const dueDate = isOverdue
-        ? parseBusinessDate('2026-08-15')
-        : addDays(issueDate, 15);
-
-      const rawLines: RawInvoiceLineInput[] = [
-        {
-          productId: prodSuite.id,
-          variantId: variantOdoo.id,
-          description: 'Brightloop Business Suite (Odoo)',
-          quantity: 1,
-          unitPrice: new Decimal('1560.00'),
-          allocatedDiscount: i % 3 === 0 ? new Decimal('100.00') : new Decimal('0.00'),
-          taxRatePercent: new Decimal('18.00'),
-          taxId: tax18.id,
-          sortOrder: 1,
-        },
-      ];
-
-      const totals = calculateInvoiceTotals(rawLines);
-      let amountPaid = new Decimal('0.00');
-
-      if (status === 'PAID') {
-        amountPaid = totals.total;
-      } else if (status === 'CONFIRMED' && !isOverdue && i % 2 === 0) {
-        // Partial payment
-        amountPaid = new Decimal('500.00');
-      }
-
-      const inv = await tx.invoice.create({
-        data: {
-          id: `seed_inv_${i}`,
-          number: status === 'DRAFT' ? null : invNum,
-          subscriptionId: targetSub.id,
-          customerId: targetSub.customerId,
-          status,
-          periodStart,
-          periodEnd,
-          issueDate,
-          dueDate,
-          subtotal: totals.subtotal.toString(),
-          discountTotal: totals.discountTotal.toString(),
-          taxableTotal: totals.taxableTotal.toString(),
-          taxTotal: totals.taxTotal.toString(),
-          total: totals.total.toString(),
-          amountPaid: amountPaid.toString(),
-          confirmedAt: status !== 'DRAFT' ? issueDate : null,
-          cancelledAt: status === 'CANCELLED' ? addDays(issueDate, 2) : null,
-          createdAt: issueDate,
-          lines: {
-            create: totals.lines.map((l) => ({
-              productId: l.productId,
-              variantId: l.variantId,
-              description: l.description,
-              quantity: l.quantity,
-              unitPrice: l.unitPrice.toString(),
-              grossAmount: l.grossAmount.toString(),
-              allocatedDiscount: l.allocatedDiscount.toString(),
-              taxableAmount: l.taxableAmount.toString(),
-              taxId: l.taxId,
-              taxRatePercent: l.taxRatePercent.toString(),
-              taxAmount: l.taxAmount.toString(),
-              sortOrder: l.sortOrder,
-            })),
-          },
-        },
-      });
-
-      // Record payments if amountPaid > 0
-      if (amountPaid.greaterThan(0)) {
-        const methods = ['BANK_TRANSFER', 'CREDIT_CARD', 'UPI', 'CASH', 'CHEQUE'] as const;
-        await tx.payment.create({
-          data: {
-            invoiceId: inv.id,
-            amount: amountPaid.toString(),
-            method: methods[i % methods.length],
-            paidOn: issueDate,
-            note: 'Seeded verified payment',
-            recordedById: staffUser.id,
-            createdAt: issueDate,
-          },
-        });
-      }
-    });
-  }
-
-  // 11. Historical billing run (7 days ago, excluding migrated subscriptions)
-  const historicalRunDate = addDays(today, -7);
-  console.log('Executing historical billing run...');
-  await runBilling(staffUser.id, {
-    runDate: historicalRunDate,
-    maxPeriods: 12,
-    excludeSubscriptionIds: [migratedMonthly.id, migratedDaily.id],
-  });
-
-  // 12. Email Outbox entries (at least 2: one PASSWORD_RESET, one INVOICE_SENT)
-  await prisma.emailOutbox.create({
-    data: {
-      toAddress: 'customer@brightloop.demo',
-      subject: 'Password Reset Request',
-      body: 'You requested a password reset for Brightloop. Link: http://localhost:3000/reset-password?token=demo_token_123. Simulated delivery: not sent.',
-      kind: 'PASSWORD_RESET',
-      createdAt: addDays(today, -1),
-    },
-  });
-
-  await prisma.emailOutbox.create({
-    data: {
-      toAddress: customerRecords[1].email,
-      subject: 'Brightloop Invoice INV-2026-000001',
-      body: 'Dear Customer, your invoice is ready. Total: ₹1722.80. Due Date: 2026-11-15. Simulated delivery: not sent.',
-      kind: 'INVOICE_SENT',
-      createdAt: addDays(today, -2),
-    },
-  });
-
-  // Final write: system setting seed.version
+  // ==========================================
+  // 17. Final Marker: seed.version
+  // ==========================================
   await prisma.systemSetting.upsert({
     where: { key: 'seed.version' },
     update: { value: targetVersion },

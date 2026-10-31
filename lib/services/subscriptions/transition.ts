@@ -18,6 +18,8 @@ export interface TransitionSubscriptionInput {
   billingRunId?: string | null;
   closeReason?: string | null;
   todayOverride?: Date; // For testing or simulated runs
+  asOfDate?: Date; // Optional clock parameter for historical backdating
+  auditAt?: Date; // Optional backdated audit createdAt
 }
 
 export async function transitionSubscription(
@@ -32,7 +34,8 @@ export async function transitionSubscriptionTx(
   tx: Prisma.TransactionClient,
   input: TransitionSubscriptionInput
 ): Promise<{ status: string; number?: string | null }> {
-  const today = input.todayOverride || todayBusinessDate();
+  const effectiveNow = input.asOfDate || input.todayOverride || new Date();
+  const today = input.asOfDate || input.todayOverride || todayBusinessDate();
 
   // 1. Lock the subscription row
   const lockedRows = await tx.$queryRaw<
@@ -114,7 +117,7 @@ export async function transitionSubscriptionTx(
       toStatus = 'CLOSED';
       updateData = {
         status: toStatus,
-        closedAt: new Date(),
+        closedAt: effectiveNow,
         closeReason: input.closeReason,
       };
       break;
@@ -127,7 +130,7 @@ export async function transitionSubscriptionTx(
       toStatus = 'CLOSED';
       updateData = {
         status: toStatus,
-        closedAt: new Date(),
+        closedAt: effectiveNow,
         closeReason: input.closeReason || 'Quotation cancelled',
       };
       break;
@@ -194,7 +197,7 @@ export async function transitionSubscriptionTx(
       toStatus = 'CLOSED';
       updateData = {
         status: toStatus,
-        closedAt: new Date(),
+        closedAt: effectiveNow,
         closeReason: input.closeReason || 'Cancelled before activation',
       };
       break;
@@ -213,7 +216,7 @@ export async function transitionSubscriptionTx(
       toStatus = 'PAUSED';
       updateData = {
         status: toStatus,
-        pausedAt: new Date(),
+        pausedAt: effectiveNow,
       };
       break;
     }
@@ -256,7 +259,7 @@ export async function transitionSubscriptionTx(
       toStatus = 'CLOSED';
       updateData = {
         status: toStatus,
-        closedAt: new Date(),
+        closedAt: effectiveNow,
         closeReason: input.closeReason || 'Early closure',
       };
       break;
@@ -279,7 +282,7 @@ export async function transitionSubscriptionTx(
       toStatus = 'CLOSED';
       updateData = {
         status: toStatus,
-        closedAt: new Date(),
+        closedAt: effectiveNow,
         closeReason: input.closeReason || 'EXPIRED',
       };
       break;
@@ -308,6 +311,7 @@ export async function transitionSubscriptionTx(
       metadata: {
         closeReason: input.closeReason ?? null,
       },
+      auditAt: input.auditAt || input.asOfDate || input.todayOverride,
     },
     tx
   );

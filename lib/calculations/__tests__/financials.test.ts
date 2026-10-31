@@ -12,6 +12,7 @@ import { calculateMRRandARR, SubscriptionForMRR } from '../mrr';
 import { isInvoiceOverdue } from '../overdue';
 import { calculateHistoricalChurn, AuditRowForChurn } from '../churn';
 import { parseBusinessDate } from '../../dates/business-date';
+import { countRemainingDuePeriods } from '../../services/billing/remaining';
 
 describe('Financial Calculations: Money, Tax & Invoice Totals', () => {
   it('applies ROUND_HALF_UP correctly', () => {
@@ -110,7 +111,7 @@ describe('Discount Eligibility and Sequential Allocation', () => {
     expect(isDiscountEligible({ ...baseDiscount, timesUsed: 5 }, lines, issueDate)).toBe(false);
   });
 
-  it('allocates sequentially: exhausting discount prevents later discount from consuming usage', () => {
+  it('allocates sequentially: exhausting discount prevents later discount from consuming usage', async () => {
     const lines: LineForDiscount[] = [
       {
         id: 'l1',
@@ -160,7 +161,7 @@ describe('Discount Eligibility and Sequential Allocation', () => {
       return true;
     };
 
-    const res = allocateDiscountsSequential([disc1, disc2], lines, issueDate, tryIncrement);
+    const res = await allocateDiscountsSequential([disc1, disc2], lines, issueDate, tryIncrement);
 
     expect(res.allocations.length).toBe(1);
     expect(res.allocations[0].discountId).toBe('d1');
@@ -169,7 +170,7 @@ describe('Discount Eligibility and Sequential Allocation', () => {
     expect(usageRecords).toEqual(['d1']);
   });
 
-  it('guarantees allocations sum exactly to discount amount and never exceed line remaining', () => {
+  it('guarantees allocations sum exactly to discount amount and never exceed line remaining', async () => {
     const lines: LineForDiscount[] = [
       {
         id: 'l1',
@@ -213,12 +214,289 @@ describe('Discount Eligibility and Sequential Allocation', () => {
       createdAt: new Date('2026-01-01'),
     };
 
-    const res = allocateDiscountsSequential([disc], lines, issueDate);
+    const res = await allocateDiscountsSequential([disc], lines, issueDate);
     const alloc = res.allocations[0];
     expect(alloc.amount.toString()).toBe('50');
 
     const sumLines = alloc.lineAllocations.reduce((s, a) => s.plus(a.amount), new Decimal(0));
     expect(sumLines.toString()).toBe('50');
+  });
+
+  // R2: Rejected increment
+  it('R2: rejected increment does not reduce line amounts and allows later discount to claim remaining base', async () => {
+    const lines: LineForDiscount[] = [
+      {
+        id: 'l1',
+        productId: 'p1',
+        quantity: 1,
+        unitPrice: new Decimal('100.00'),
+        grossAmount: new Decimal('100.00'),
+        sortOrder: 1,
+      },
+    ];
+
+    const d1: CandidateDiscount = {
+      id: 'd1',
+      name: 'Disc 1',
+      kind: 'FIXED',
+      value: new Decimal('50.00'),
+      scope: 'SUBSCRIPTION',
+      minPurchaseAmount: null,
+      minQuantity: null,
+      startsOn: parseBusinessDate('2026-01-01'),
+      endsOn: null,
+      isActive: true,
+      createdAt: new Date('2026-01-01'),
+    };
+
+    const d2: CandidateDiscount = {
+      id: 'd2',
+      name: 'Disc 2',
+      kind: 'FIXED',
+      value: new Decimal('40.00'),
+      scope: 'SUBSCRIPTION',
+      minPurchaseAmount: null,
+      minQuantity: null,
+      startsOn: parseBusinessDate('2026-01-01'),
+      endsOn: null,
+      isActive: true,
+      createdAt: new Date('2026-01-02'),
+    };
+
+    // d1 rejected by callback, d2 accepted
+    const tryIncrement = (id: string) => id === 'd2';
+
+    const res = await allocateDiscountsSequential([d1, d2], lines, issueDate, tryIncrement);
+    expect(res.allocations.length).toBe(1);
+    expect(res.allocations[0].discountId).toBe('d2');
+    expect(res.totalDiscount.toString()).toBe('40');
+    expect(res.lineDiscounts.get('l1')?.toString()).toBe('40');
+  });
+
+  // R3: Zero contribution does not consume usage
+  it('R3: zero contribution does not invoke usage increment callback', async () => {
+    const lines: LineForDiscount[] = [
+      {
+        id: 'l1',
+        productId: 'p1',
+        quantity: 1,
+        unitPrice: new Decimal('50.00'),
+        grossAmount: new Decimal('50.00'),
+        sortOrder: 1,
+      },
+    ];
+
+    const d1: CandidateDiscount = {
+      id: 'd1',
+      name: 'Full 50 off',
+      kind: 'FIXED',
+      value: new Decimal('50.00'),
+      scope: 'SUBSCRIPTION',
+      minPurchaseAmount: null,
+      minQuantity: null,
+      startsOn: parseBusinessDate('2026-01-01'),
+      endsOn: null,
+      isActive: true,
+      createdAt: new Date('2026-01-01'),
+    };
+
+    const d2: CandidateDiscount = {
+      id: 'd2',
+      name: 'Second 20 off',
+      kind: 'FIXED',
+      value: new Decimal('20.00'),
+      scope: 'SUBSCRIPTION',
+      minPurchaseAmount: null,
+      minQuantity: null,
+      startsOn: parseBusinessDate('2026-01-01'),
+      endsOn: null,
+      isActive: true,
+      createdAt: new Date('2026-01-02'),
+    };
+
+    const incremented: string[] = [];
+    const tryIncrement = (id: string) => {
+      incremented.push(id);
+      return true;
+    };
+
+    const res = await allocateDiscountsSequential([d1, d2], lines, issueDate, tryIncrement);
+    expect(res.allocations.length).toBe(1);
+    expect(res.allocations[0].discountId).toBe('d1');
+    expect(incremented).toEqual(['d1']);
+  });
+
+  // R4: Sequential accept/reject/accept
+  it('R4: sequential accept/reject/accept produces invoice with accepted discounts only', async () => {
+    const lines: LineForDiscount[] = [
+      {
+        id: 'l1',
+        productId: 'p1',
+        quantity: 1,
+        unitPrice: new Decimal('100.00'),
+        grossAmount: new Decimal('100.00'),
+        sortOrder: 1,
+      },
+    ];
+
+    const d1: CandidateDiscount = {
+      id: 'd1',
+      name: 'D1 10 off',
+      kind: 'FIXED',
+      value: new Decimal('10.00'),
+      scope: 'SUBSCRIPTION',
+      minPurchaseAmount: null,
+      minQuantity: null,
+      startsOn: parseBusinessDate('2026-01-01'),
+      endsOn: null,
+      isActive: true,
+      createdAt: new Date('2026-01-01'),
+    };
+
+    const d2: CandidateDiscount = {
+      id: 'd2',
+      name: 'D2 20 off',
+      kind: 'FIXED',
+      value: new Decimal('20.00'),
+      scope: 'SUBSCRIPTION',
+      minPurchaseAmount: null,
+      minQuantity: null,
+      startsOn: parseBusinessDate('2026-01-01'),
+      endsOn: null,
+      isActive: true,
+      createdAt: new Date('2026-01-02'),
+    };
+
+    const d3: CandidateDiscount = {
+      id: 'd3',
+      name: 'D3 30 off',
+      kind: 'FIXED',
+      value: new Decimal('30.00'),
+      scope: 'SUBSCRIPTION',
+      minPurchaseAmount: null,
+      minQuantity: null,
+      startsOn: parseBusinessDate('2026-01-01'),
+      endsOn: null,
+      isActive: true,
+      createdAt: new Date('2026-01-03'),
+    };
+
+    // D1 accepted, D2 rejected, D3 accepted
+    const tryIncrement = (id: string) => id === 'd1' || id === 'd3';
+
+    const res = await allocateDiscountsSequential([d1, d2, d3], lines, issueDate, tryIncrement);
+    expect(res.allocations.map((a) => a.discountId)).toEqual(['d1', 'd3']);
+    expect(res.totalDiscount.toString()).toBe('40');
+    expect(res.lineDiscounts.get('l1')?.toString()).toBe('40');
+  });
+
+  // R19: Minimum purchase uses pre-discount gross
+  it('R19: minimum purchase threshold is evaluated against pre-discount gross', async () => {
+    const lines: LineForDiscount[] = [
+      {
+        id: 'l1',
+        productId: 'p1',
+        quantity: 1,
+        unitPrice: new Decimal('100.00'),
+        grossAmount: new Decimal('100.00'),
+        sortOrder: 1,
+      },
+    ];
+
+    const d1: CandidateDiscount = {
+      id: 'd1',
+      name: 'D1 50 off',
+      kind: 'FIXED',
+      value: new Decimal('50.00'),
+      scope: 'SUBSCRIPTION',
+      minPurchaseAmount: null,
+      minQuantity: null,
+      startsOn: parseBusinessDate('2026-01-01'),
+      endsOn: null,
+      isActive: true,
+      createdAt: new Date('2026-01-01'),
+    };
+
+    // d2 requires minPurchaseAmount = 100.
+    // Even though line remaining after d1 is 50, d2's min purchase applies against pre-discount gross (100)
+    const d2: CandidateDiscount = {
+      id: 'd2',
+      name: 'D2 10 off with 100 min',
+      kind: 'FIXED',
+      value: new Decimal('10.00'),
+      scope: 'SUBSCRIPTION',
+      minPurchaseAmount: new Decimal('100.00'),
+      minQuantity: null,
+      startsOn: parseBusinessDate('2026-01-01'),
+      endsOn: null,
+      isActive: true,
+      createdAt: new Date('2026-01-02'),
+    };
+
+    const res = await allocateDiscountsSequential([d1, d2], lines, issueDate, () => true);
+    expect(res.allocations.map((a) => a.discountId)).toEqual(['d1', 'd2']);
+    expect(res.totalDiscount.toString()).toBe('60');
+  });
+
+  // R25: PRODUCT scope with and without productIds
+  it('R25: PRODUCT scope discount without productIds is ineligible; with productIds applies only to matching products', async () => {
+    const lines: LineForDiscount[] = [
+      {
+        id: 'l1',
+        productId: 'p1',
+        quantity: 1,
+        unitPrice: new Decimal('100.00'),
+        grossAmount: new Decimal('100.00'),
+        sortOrder: 1,
+      },
+      {
+        id: 'l2',
+        productId: 'p2',
+        quantity: 1,
+        unitPrice: new Decimal('50.00'),
+        grossAmount: new Decimal('50.00'),
+        sortOrder: 2,
+      },
+    ];
+
+    // Missing productIds
+    const dEmptyProduct: CandidateDiscount = {
+      id: 'd-empty',
+      name: 'Empty Product Scope',
+      kind: 'FIXED',
+      value: new Decimal('20.00'),
+      scope: 'PRODUCT',
+      minPurchaseAmount: null,
+      minQuantity: null,
+      startsOn: parseBusinessDate('2026-01-01'),
+      endsOn: null,
+      isActive: true,
+      createdAt: new Date('2026-01-01'),
+      productIds: [],
+    };
+    expect(isDiscountEligible(dEmptyProduct, lines, issueDate)).toBe(false);
+
+    // Matching product p2 only
+    const dProduct2: CandidateDiscount = {
+      id: 'd-p2',
+      name: 'P2 discount',
+      kind: 'FIXED',
+      value: new Decimal('20.00'),
+      scope: 'PRODUCT',
+      minPurchaseAmount: null,
+      minQuantity: null,
+      startsOn: parseBusinessDate('2026-01-01'),
+      endsOn: null,
+      isActive: true,
+      createdAt: new Date('2026-01-02'),
+      productIds: ['p2'],
+    };
+
+    const res = await allocateDiscountsSequential([dEmptyProduct, dProduct2], lines, issueDate, () => true);
+    expect(res.allocations.length).toBe(1);
+    expect(res.allocations[0].discountId).toBe('d-p2');
+    expect(res.lineDiscounts.get('l1')?.toString()).toBe('0');
+    expect(res.lineDiscounts.get('l2')?.toString()).toBe('20');
   });
 });
 
@@ -402,5 +680,47 @@ describe('Historical Churn Calculation', () => {
     expect(res.denominator).toBe(2); // sub1 and sub2
     expect(res.numerator).toBe(1);   // sub1 closed
     expect(res.churnRatePercent).toBe(50.0);
+  });
+});
+
+describe('R14: Billable-period agreement (unit)', () => {
+  it('correctly counts normal due periods', () => {
+    // Start Jan 1, cycle 0, runDate Mar 15: 3 periods due (Jan, Feb, Mar)
+    const res = countRemainingDuePeriods(
+      parseBusinessDate('2026-01-01'),
+      'MONTHLY',
+      1,
+      0,
+      parseBusinessDate('2026-03-15'),
+      null
+    );
+    expect(res.remainingDuePeriods).toBe(3);
+    expect(res.overflow).toBe(false);
+  });
+
+  it('correctly includes period starting exactly on expiry date', () => {
+    // Start Jan 1, expiry Mar 1, runDate Mar 15: periods Jan 1, Feb 1, Mar 1 (all <= expiryDate)
+    const res = countRemainingDuePeriods(
+      parseBusinessDate('2026-01-01'),
+      'MONTHLY',
+      1,
+      0,
+      parseBusinessDate('2026-03-15'),
+      parseBusinessDate('2026-03-01')
+    );
+    expect(res.remainingDuePeriods).toBe(3);
+  });
+
+  it('stops at expiry boundary and returns 0 when current period is past expiry date', () => {
+    // Start Jan 1, expiry Feb 15. At cycle index 2 (period start Mar 1), periodStart > expiryDate
+    const res = countRemainingDuePeriods(
+      parseBusinessDate('2026-01-01'),
+      'MONTHLY',
+      1,
+      2,
+      parseBusinessDate('2026-03-15'),
+      parseBusinessDate('2026-02-15')
+    );
+    expect(res.remainingDuePeriods).toBe(0);
   });
 });

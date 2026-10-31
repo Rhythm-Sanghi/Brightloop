@@ -10,6 +10,7 @@ export interface CreateAuditLogInput {
   fromStatus?: string | null;
   toStatus?: string | null;
   metadata?: Prisma.InputJsonValue;
+  auditAt?: Date;
 }
 
 export async function createAuditLog(
@@ -27,6 +28,7 @@ export async function createAuditLog(
       fromStatus: input.fromStatus ?? null,
       toStatus: input.toStatus ?? null,
       metadata: input.metadata ?? Prisma.DbNull,
+      ...(input.auditAt ? { createdAt: input.auditAt } : {}),
     },
   });
 }

@@ -13,18 +13,18 @@ export interface LineForDiscount {
 export interface CandidateDiscount {
   id: string;
   name: string;
+  createdAt: Date;
   kind: 'FIXED' | 'PERCENT';
   value: Decimal;
   scope: 'PRODUCT' | 'SUBSCRIPTION';
-  minPurchaseAmount: Decimal | null;
-  minQuantity: number | null;
   startsOn: Date;
   endsOn: Date | null;
-  maxUses: number | null;
-  timesUsed: number;
+  minPurchaseAmount: Decimal | null;
+  minQuantity: number | null;
   isActive: boolean;
-  createdAt: Date;
-  productIds?: string[]; // For PRODUCT scope
+  maxUses?: number | null;
+  timesUsed?: number;
+  productIds?: string[];
 }
 
 export interface DiscountAllocationResult {
@@ -46,9 +46,15 @@ export function isDiscountEligible(
   if (issueTime < startTime) return false;
   if (discount.endsOn && issueTime > discount.endsOn.getTime()) return false;
 
+  if (discount.scope === 'PRODUCT') {
+    if (!discount.productIds || discount.productIds.length === 0) {
+      return false;
+    }
+  }
+
   if (linesInScope.length === 0) return false;
 
-  // Minimum purchase check measured before any discounts
+  // Minimum purchase check measured against original gross amount before any discounts
   const grossBeforeDiscount = linesInScope.reduce(
     (sum, line) => sum.plus(line.grossAmount),
     new Decimal(0)
@@ -58,30 +64,30 @@ export function isDiscountEligible(
     return false;
   }
 
-  // Minimum quantity check
+  // Minimum quantity check measured against original quantity sum
   const totalQuantity = linesInScope.reduce((sum, line) => sum + line.quantity, 0);
   if (discount.minQuantity && totalQuantity < discount.minQuantity) {
     return false;
   }
 
-  if (checkUsage && discount.maxUses !== null && discount.timesUsed >= discount.maxUses) {
+  if (checkUsage && discount.maxUses !== null && discount.maxUses !== undefined && (discount.timesUsed ?? 0) >= discount.maxUses) {
     return false;
   }
 
   return true;
 }
 
-export function allocateDiscountsSequential(
+export async function allocateDiscountsSequential(
   candidateDiscounts: CandidateDiscount[],
   lines: LineForDiscount[],
   issueDate: Date,
   tryIncrementUsage?: (discountId: string) => boolean | Promise<boolean>
-): {
+): Promise<{
   allocations: DiscountAllocationResult[];
   lineDiscounts: Map<string, Decimal>;
   totalDiscount: Decimal;
-} {
-  // Sort candidate discounts by createdAt, then id
+}> {
+  // Sort candidate discounts by createdAt ASC, id ASC (spec §11.3)
   const sortedDiscounts = [...candidateDiscounts].sort((a, b) => {
     const timeDiff = a.createdAt.getTime() - b.createdAt.getTime();
     if (timeDiff !== 0) return timeDiff;
@@ -104,33 +110,36 @@ export function allocateDiscountsSequential(
 
   for (const discount of sortedDiscounts) {
     // 1. Identify lines in scope
-    const linesInScope = lines.filter((l) => {
-      if (discount.scope === 'SUBSCRIPTION') return true;
-      if (discount.scope === 'PRODUCT') {
-        return discount.productIds?.includes(l.productId);
+    let linesInScope: LineForDiscount[] = [];
+    if (discount.scope === 'PRODUCT') {
+      if (!discount.productIds || discount.productIds.length === 0) {
+        continue;
       }
-      return false;
-    });
+      linesInScope = lines.filter((l) => discount.productIds!.includes(l.productId));
+    } else if (discount.scope === 'SUBSCRIPTION') {
+      linesInScope = [...lines];
+    } else {
+      continue;
+    }
 
     if (linesInScope.length === 0) continue;
 
-    // Remaining base = eligible gross - allocations already made to those lines
+    // 2. Check eligibility per spec §11.2 (without usage check, evaluated against original gross & qty)
+    if (!isDiscountEligible(discount, linesInScope, issueDate, false)) {
+      continue;
+    }
+
+    // 3. Remaining base = eligible gross - allocations already accepted on those lines
     const remainingBase = linesInScope.reduce((sum, l) => {
       const rem = remainingPerLine.get(l.id) || new Decimal(0);
       return sum.plus(rem);
     }, new Decimal(0));
 
-    // 2. If candidate fails eligibility (without checking usage yet), skip it
-    if (!isDiscountEligible(discount, linesInScope, issueDate, false)) {
-      continue;
-    }
-
-    // 3. If remaining base is zero, skip it
     if (remainingBase.lessThanOrEqualTo(0)) {
-      continue;
+      continue; // Skip, do not touch usage
     }
 
-    // 4. Compute discount amount
+    // 4. Compute discount amount per spec §11.3 step 4
     let discountAmount = new Decimal(0);
     if (discount.kind === 'FIXED') {
       discountAmount = Decimal.min(discount.value, remainingBase);
@@ -141,23 +150,26 @@ export function allocateDiscountsSequential(
 
     discountAmount = round2(discountAmount);
     if (discountAmount.lessThanOrEqualTo(0)) {
-      continue;
+      continue; // Skip, do not touch usage
     }
 
-    // 5. Attempt conditional usage increment if provided, or check local maxUses
+    // 5. Attempt conditional usage increment (D1, D2)
     if (tryIncrementUsage) {
-      const incremented = tryIncrementUsage(discount.id);
+      const incremented = await tryIncrementUsage(discount.id);
       if (!incremented) {
+        // Increment rejected -> contributes nothing, continue to next discount without allocating
         continue;
       }
     } else {
-      if (discount.maxUses !== null && discount.timesUsed >= discount.maxUses) {
+      // In-memory usage check for unit tests
+      const currentUsed = discount.timesUsed ?? 0;
+      if (discount.maxUses !== null && discount.maxUses !== undefined && currentUsed >= discount.maxUses) {
         continue;
       }
-      discount.timesUsed += 1;
+      discount.timesUsed = currentUsed + 1;
     }
 
-    // 6. Allocate discount across eligible lines in proportion to remaining amount
+    // 6. On acceptance: allocate discount across eligible lines with remaining > 0 (spec §11.3 step 6)
     const eligibleLinesWithRemaining = linesInScope
       .filter((l) => (remainingPerLine.get(l.id) || new Decimal(0)).greaterThan(0))
       .sort((a, b) => a.sortOrder - b.sortOrder);
@@ -187,7 +199,6 @@ export function allocateDiscountsSequential(
     if (remainder.greaterThan(lastLineRem)) {
       lineAllocMap.set(lastLine.id, lastLineRem);
       let leftover = remainder.minus(lastLineRem);
-      // Distribute leftover cent by cent to earlier lines with spare capacity
       const cent = new Decimal('0.01');
       for (const line of eligibleLinesWithRemaining) {
         if (leftover.lessThanOrEqualTo(0)) break;

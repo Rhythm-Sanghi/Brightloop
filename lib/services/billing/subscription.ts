@@ -5,9 +5,12 @@ import { countRemainingDuePeriods } from './remaining';
 import { createAuditLog } from '../audit';
 import { BillingOutcome } from '../../constants';
 
+export const MAX_REPAIRS_PER_SUBSCRIPTION_PER_RUN = 3;
+
 export interface ProcessSubscriptionResult {
   finalOutcome: BillingOutcome;
   invoicesGenerated: number;
+  repairsUsed: number;
   attemptsUsed: number;
   remainingDuePeriods: number;
   reason?: string | null;
@@ -18,50 +21,63 @@ export async function processSubscription(
   billingRunId: string,
   runDate: Date,
   maxPeriods: number,
-  testOptions?: BillingTestOptions
+  testOptions?: BillingTestOptions,
+  auditAt?: Date
 ): Promise<ProcessSubscriptionResult> {
   let invoicesGenerated = 0;
-  let attemptsUsed = 0;
+  let repairsUsed = 0;
   let finalOutcome: BillingOutcome = 'FULLY_PROCESSED';
   let reason: string | null = null;
   let errorCode: string | null = null;
   let closedByExpiry = false;
-  let stoppedEarly = false;
 
-  while (attemptsUsed < maxPeriods) {
-    attemptsUsed++;
-    const res = await runPeriod(subscriptionId, billingRunId, runDate, testOptions);
+  while (invoicesGenerated < maxPeriods) {
+    const allowRepair =
+      testOptions?.allowRepair !== undefined
+        ? testOptions.allowRepair && repairsUsed < MAX_REPAIRS_PER_SUBSCRIPTION_PER_RUN
+        : repairsUsed < MAX_REPAIRS_PER_SUBSCRIPTION_PER_RUN;
+
+    const res = await runPeriod(
+      subscriptionId,
+      billingRunId,
+      runDate,
+      {
+        ...testOptions,
+        allowRepair,
+      },
+      auditAt
+    );
 
     if (res.type === 'INVOICE_CREATED') {
       invoicesGenerated++;
+      if (invoicesGenerated === maxPeriods) {
+        break;
+      }
       continue;
     }
 
     if (res.type === 'REPAIRED') {
+      repairsUsed++;
       continue;
     }
 
     if (res.type === 'NOT_DUE') {
-      stoppedEarly = true;
       reason = res.reason || 'ALREADY_CURRENT';
       break;
     }
 
     if (res.type === 'EXPIRED_CLOSED') {
-      stoppedEarly = true;
       closedByExpiry = true;
       reason = 'AUTO_CLOSED_EXPIRED';
       break;
     }
 
     if (res.type === 'EXPIRED_AWAITING') {
-      stoppedEarly = true;
       reason = 'EXPIRED_AWAITING_CLOSURE';
       break;
     }
 
     if (res.type === 'FAILED') {
-      stoppedEarly = true;
       errorCode = res.errorCode || 'FAILED';
       reason = res.reason || errorCode;
       finalOutcome = 'FAILED';
@@ -90,19 +106,14 @@ export async function processSubscription(
     overflow = remResult.overflow;
   }
 
-  // Outcome classification (pure table):
-  // cap reached with remaining due periods gives PARTIALLY_PROCESSED;
-  // cap reached with none remaining gives FULLY_PROCESSED;
-  // a failure gives FAILED;
-  // no invoice and no pending work gives SKIPPED;
-  // at least one invoice and no pending work gives FULLY_PROCESSED.
+  // Outcome precedence (spec §10.4):
   if (finalOutcome !== 'FAILED') {
-    if (attemptsUsed >= maxPeriods && remaining > 0) {
+    if (remaining > 0) {
       finalOutcome = 'PARTIALLY_PROCESSED';
-    } else if (invoicesGenerated === 0) {
-      finalOutcome = 'SKIPPED';
-    } else {
+    } else if (invoicesGenerated > 0) {
       finalOutcome = 'FULLY_PROCESSED';
+    } else {
+      finalOutcome = 'SKIPPED';
     }
   }
 
@@ -122,12 +133,14 @@ export async function processSubscription(
           finalOutcome,
           reason,
           invoicesGenerated,
-          attemptsUsed,
+          repairsUsed,
+          attemptsUsed: invoicesGenerated + repairsUsed,
           remainingDuePeriods: remaining,
           overflow,
           closedByExpiry,
           errorCode,
         },
+        auditAt,
       },
       tx
     );
@@ -136,7 +149,8 @@ export async function processSubscription(
   return {
     finalOutcome,
     invoicesGenerated,
-    attemptsUsed,
+    repairsUsed,
+    attemptsUsed: invoicesGenerated + repairsUsed,
     remainingDuePeriods: remaining,
     reason,
   };
