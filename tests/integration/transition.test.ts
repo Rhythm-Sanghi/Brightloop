@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterEach, afterAll } from 'vitest';
 import { prisma } from '../../lib/db/prisma';
 import { transitionSubscription } from '../../lib/services/subscriptions/transition';
 import { parseBusinessDate } from '../../lib/dates/business-date';
@@ -140,10 +140,34 @@ describe('Subscription Transition Lifecycle and Plan Rule Gating', () => {
     if (createdSubIds.length === 0) return;
     const ids = [...createdSubIds];
     // Cleanup must close every owned subscription. Errors are not swallowed.
-    await prisma.subscription.updateMany({
+    const res = await prisma.subscription.updateMany({
       where: { id: { in: ids } },
-      data: { status: 'CLOSED' },
+      data: {
+        status: 'CLOSED',
+        closeReason: 'TEST_CLEANUP',
+        closedAt: new Date(),
+      },
     });
+    if (res.count !== ids.length) {
+      throw new Error(`Expected ${ids.length} subscriptions cleaned up in transition afterEach, but updated ${res.count}`);
+    }
+    createdSubIds.length = 0;
+  });
+
+  afterAll(async () => {
+    if (createdSubIds.length === 0) return;
+    const ids = [...createdSubIds];
+    const res = await prisma.subscription.updateMany({
+      where: { id: { in: ids } },
+      data: {
+        status: 'CLOSED',
+        closeReason: 'TEST_CLEANUP',
+        closedAt: new Date(),
+      },
+    });
+    if (res.count !== ids.length) {
+      throw new Error(`Expected ${ids.length} subscriptions cleaned up in transition afterAll, but updated ${res.count}`);
+    }
     createdSubIds.length = 0;
   });
 

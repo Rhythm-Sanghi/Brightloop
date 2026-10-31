@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import Decimal from 'decimal.js';
-import { prisma } from '../../db/prisma';
 import { createDiscount, updateDiscount } from '../discounts';
 import { parseBusinessDate } from '../../dates/business-date';
 

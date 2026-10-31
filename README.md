@@ -2,7 +2,7 @@
 
 A subscription lifecycle, billing, and invoicing platform built as a hackathon project. It covers products and variants, plans, quotations, subscriptions, catch-up billing runs, discounts, GST invoices, partial payments, a customer self-service portal, and financial reports.
 
-> **Status: work in progress.** The core billing engine and its concurrency tests are implemented. Several items are open, including load-scale performance, the demo walkthrough, and fixture isolation in the integration suite. See [Status](#status) before relying on any claim in this document.
+> **Status: work in progress.** The core billing engine and its concurrency tests are implemented. Several items are open, including load-scale performance and the demo walkthrough. See [Status](#status) before relying on any claim in this document.
 
 ---
 
@@ -86,7 +86,8 @@ npm test                  # unit tests only
 npm run test:integration  # integration tests against brightloop_test
 ```
 
-- `npm test` does **not** run the transition integration tests. Subscription lifecycle rules are covered only by `npm run test:integration`.
+- `npm test` does **not** run the transition integration tests.
+- `npm run test:integration` runs integration tests against `brightloop_test` (includes transition integration tests; transition rules are covered only by the integration suite; requires `DATABASE_URL_TEST` pointing to `brightloop_test`).
 - `npm run test:integration` resets `brightloop_test` before it runs, using committed migrations. It refuses to run unless the target is `brightloop_test` on a local host and differs from the development database.
 - Integration tests must run sequentially (`fileParallelism: false`).
 
@@ -165,7 +166,7 @@ This table records what has been checked and how. "Verified" means test output o
 | Request race (B5) | Verified | Integration test output with passing results. |
 | Historical invoice stability (B8) | Verified | Integration test output with passing results. |
 | Reconciliation with direct SQL (N8) | Reported | A reconciliation test file exists and passed. Its scope has not been reviewed against spec §15. |
-| Fixture isolation across integration files | Open | Three subscriptions owned by `request-race.test.ts` and `customer-auth.test.ts` remain eligible after their files finish, which inflates pending counts in later runs. |
+| Fixture isolation across integration files | State-verified | Fixtures sub1, sub2, subA, and subB closed by their owning files with closeReason TEST_CLEANUP; post-run SQL confirmed status CLOSED. |
 | Reset-script rejection with missing environment | Open | Not executed. The source shows the check returns before any reset. |
 | Load-scale seed (2,000 subscriptions) | Open | Not implemented. The seed currently produces demo scale only. |
 | Page performance under 2 seconds | Open | Not measured at load scale. |
@@ -207,7 +208,7 @@ Verification of the non-negotiables (N1 to N10) is summarised in the table above
 
 ## Known limitations and debt
 
-- **Fixture isolation:** three subscriptions created by `request-race.test.ts` and `customer-auth.test.ts` stay eligible after their files finish. They appear in pending counts for later billing runs, including the R12 test run date. R12 asserts only its own subscription, so it passes, but the aggregate pending count includes these rows. Fix planned, not yet implemented.
+- **Fixture isolation:** fixtures sub1, sub2, subA, and subB are closed with TEST_CLEANUP by their owning files. Request-race logs its closure; customer-auth and transition closures are verified at the database-state level after the test run.
 - **Transition coverage:** the six transition tests run only in the integration suite.
 - **Rate limiter:** the login rate limiter is in memory. It resets when the server restarts and does not work across multiple server instances.
 - **Email:** all email is simulated through the outbox. Nothing is delivered.

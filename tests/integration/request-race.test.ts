@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { prisma } from '../../lib/db/prisma';
 import { createSubscriptionRequest, reviewSubscriptionRequest } from '../../lib/services/requests';
 import { parseBusinessDate } from '../../lib/dates/business-date';
@@ -9,6 +9,7 @@ describe('B5: Request Race & Concurrency (Integration)', () => {
   let staffUserId: string;
   let subId1: string;
   let subId2: string;
+  const createdSubIds: string[] = [];
 
   beforeAll(async () => {
     const cust = await prisma.customer.create({
@@ -44,6 +45,7 @@ describe('B5: Request Race & Concurrency (Integration)', () => {
         createdById: staffUserId,
       },
     });
+    createdSubIds.push(sub1.id);
     subId1 = sub1.id;
 
     const sub2 = await prisma.subscription.create({
@@ -57,7 +59,29 @@ describe('B5: Request Race & Concurrency (Integration)', () => {
         createdById: staffUserId,
       },
     });
+    createdSubIds.push(sub2.id);
     subId2 = sub2.id;
+  });
+
+  afterAll(async () => {
+    if (createdSubIds.length === 0) return;
+    if (!createdSubIds.includes(subId1) || !createdSubIds.includes(subId2)) {
+      throw new Error(`Expected createdSubIds to contain both sub1 (${subId1}) and sub2 (${subId2})`);
+    }
+    const ids = [...createdSubIds];
+    const res = await prisma.subscription.updateMany({
+      where: { id: { in: ids } },
+      data: {
+        status: 'CLOSED',
+        closeReason: 'TEST_CLEANUP',
+        closedAt: new Date(),
+      },
+    });
+    if (res.count !== ids.length) {
+      throw new Error(`Expected ${ids.length} subscriptions cleaned up in request-race afterAll, but updated ${res.count}`);
+    }
+    console.log(`[request-race afterAll] closed ${ids.length} registered IDs: ${ids.join(', ')}; update count ${res.count}`);
+    createdSubIds.length = 0;
   });
 
   it('B5 part 1: two concurrent creations of the same request type produce one success and one REQUEST_ALREADY_PENDING', async () => {

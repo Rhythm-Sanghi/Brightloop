@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { prisma } from '../../lib/db/prisma';
 import { parseBusinessDate } from '../../lib/dates/business-date';
 import { createSubscriptionRequest } from '../../lib/services/requests';
@@ -13,6 +13,7 @@ describe('Milestone M6: Customer Portal Isolation (Blocking Test B7)', () => {
   let subBId: string;
   let invAId: string;
   let invBId: string;
+  const createdSubIds: string[] = [];
 
   beforeAll(async () => {
     // 1. Staff user
@@ -68,6 +69,7 @@ describe('Milestone M6: Customer Portal Isolation (Blocking Test B7)', () => {
         createdById: staffId,
       },
     });
+    createdSubIds.push(subA.id);
     subAId = subA.id;
 
     const subB = await prisma.subscription.create({
@@ -81,6 +83,7 @@ describe('Milestone M6: Customer Portal Isolation (Blocking Test B7)', () => {
         createdById: staffId,
       },
     });
+    createdSubIds.push(subB.id);
     subBId = subB.id;
 
     // 5. Invoice A & B
@@ -124,6 +127,23 @@ describe('Milestone M6: Customer Portal Isolation (Blocking Test B7)', () => {
       },
     });
     invBId = invB.id;
+  });
+
+  afterAll(async () => {
+    if (createdSubIds.length === 0) return;
+    const ids = [...createdSubIds];
+    const res = await prisma.subscription.updateMany({
+      where: { id: { in: ids } },
+      data: {
+        status: 'CLOSED',
+        closeReason: 'TEST_CLEANUP',
+        closedAt: new Date(),
+      },
+    });
+    if (res.count !== ids.length) {
+      throw new Error(`Expected ${ids.length} subscriptions cleaned up in customer-auth afterAll, but updated ${res.count}`);
+    }
+    createdSubIds.length = 0;
   });
 
   // -------------------------------------------------------------
