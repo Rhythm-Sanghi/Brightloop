@@ -1,0 +1,391 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                   String    @id @default(cuid())
+  name                 String
+  email                String    @unique
+  passwordHash         String
+  role                 String
+  isActive             Boolean   @default(true)
+  mustChangePassword   Boolean   @default(false)
+  sessionVersion       Int       @default(0)
+  passwordChangedAt    DateTime? @db.Timestamptz(6)
+  lastLoginAt          DateTime? @db.Timestamptz(6)
+  resetTokenHash       String?
+  resetTokenExpiresAt  DateTime? @db.Timestamptz(6)
+  customerId           String?   @unique
+  customer             Customer? @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  createdAt            DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt            DateTime  @updatedAt @db.Timestamptz(6)
+  createdSubscriptions Subscription[]      @relation("SubscriptionCreator")
+  reviewedRequests     SubscriptionRequest[]
+  payments             Payment[]
+  billingRuns          BillingRun[]
+  auditLogs            AuditLog[]
+}
+
+model Customer {
+  id            String   @id @default(cuid())
+  name          String
+  email         String   @unique
+  phone         String?
+  company       String?
+  address       String?
+  isArchived    Boolean  @default(false)
+  createdAt     DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime @updatedAt @db.Timestamptz(6)
+  user          User?
+  subscriptions Subscription[]
+  requests      SubscriptionRequest[]
+  invoices      Invoice[]
+}
+
+model Tax {
+  id                String   @id @default(cuid())
+  name              String
+  ratePercent       Decimal  @db.Decimal(5, 2)
+  isActive          Boolean  @default(true)
+  products          Product[]
+  subscriptionLines SubscriptionLine[]
+  invoiceLines      InvoiceLine[]
+}
+
+model Product {
+  id                String    @id @default(cuid())
+  name              String
+  type              String
+  salesPrice        Decimal   @db.Decimal(12, 2)
+  costPrice         Decimal   @db.Decimal(12, 2)
+  notes             String?
+  defaultTaxId      String?
+  defaultTax        Tax?      @relation(fields: [defaultTaxId], references: [id], onDelete: Restrict)
+  isActive          Boolean   @default(true)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime  @updatedAt @db.Timestamptz(6)
+  variants          ProductVariant[]
+  templateLines     QuotationTemplateLine[]
+  subscriptionLines SubscriptionLine[]
+  invoiceLines      InvoiceLine[]
+  discountProducts  DiscountProduct[]
+}
+
+model ProductVariant {
+  id                String   @id @default(cuid())
+  productId         String
+  product           Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  attribute         String
+  value             String
+  priceAdjustment   Decimal  @default(0) @db.Decimal(12, 2)
+  isActive          Boolean  @default(true)
+  templateLines     QuotationTemplateLine[]
+  subscriptionLines SubscriptionLine[]
+  invoiceLines      InvoiceLine[]
+
+  @@unique([productId, attribute, value])
+}
+
+model Plan {
+  id                String    @id @default(cuid())
+  name              String
+  billingPeriod     String
+  billingInterval   Int       @default(1)
+  minimumQuantity   Int       @default(1)
+  availableFrom     DateTime  @db.Date
+  availableUntil    DateTime? @db.Date
+  paymentTermsDays  Int       @default(15)
+  autoCloseOnExpiry Boolean   @default(true)
+  allowEarlyClose   Boolean   @default(false)
+  allowPause        Boolean   @default(false)
+  allowRenewal      Boolean   @default(true)
+  isActive          Boolean   @default(true)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime  @updatedAt @db.Timestamptz(6)
+  templates         QuotationTemplate[]
+  subscriptions     Subscription[]
+}
+
+model QuotationTemplate {
+  id            String   @id @default(cuid())
+  name          String
+  planId        String
+  plan          Plan     @relation(fields: [planId], references: [id], onDelete: Restrict)
+  validityDays  Int      @default(30)
+  notes         String?
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now()) @db.Timestamptz(6)
+  lines         QuotationTemplateLine[]
+  subscriptions Subscription[]
+}
+
+model QuotationTemplateLine {
+  id          String            @id @default(cuid())
+  templateId  String
+  template    QuotationTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product           @relation(fields: [productId], references: [id], onDelete: Restrict)
+  variantId   String?
+  variant     ProductVariant?   @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  quantity    Int               @default(1)
+}
+
+model Subscription {
+  id                  String    @id @default(cuid())
+  number              String?   @unique
+  customerId          String
+  customer            Customer  @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  planId              String
+  plan                Plan      @relation(fields: [planId], references: [id], onDelete: Restrict)
+  templateId          String?
+  template            QuotationTemplate? @relation(fields: [templateId], references: [id], onDelete: Restrict)
+  status              String
+  startDate           DateTime  @db.Date
+  expiryDate          DateTime? @db.Date
+  nextBillingDate     DateTime? @db.Date
+  billingCycleIndex   Int       @default(0)
+  quotationValidUntil DateTime? @db.Date
+  paymentTermsDays    Int
+  renewalCount        Int       @default(0)
+  pausedAt            DateTime? @db.Timestamptz(6)
+  closedAt            DateTime? @db.Timestamptz(6)
+  closeReason         String?
+  createdById         String
+  createdBy           User      @relation("SubscriptionCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt           DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime  @updatedAt @db.Timestamptz(6)
+  lines               SubscriptionLine[]
+  discounts           SubscriptionDiscount[]
+  requests            SubscriptionRequest[]
+  invoices            Invoice[]
+
+  @@index([status, nextBillingDate])
+  @@index([status, id])
+  @@index([status, expiryDate])
+  @@index([customerId])
+  @@index([planId])
+}
+
+model SubscriptionLine {
+  id             String          @id @default(cuid())
+  subscriptionId String
+  subscription   Subscription    @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  productId      String
+  product        Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  variantId      String?
+  variant        ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  quantity       Int
+  unitPrice      Decimal         @db.Decimal(12, 2)
+  taxId          String?
+  tax            Tax?            @relation(fields: [taxId], references: [id], onDelete: Restrict)
+
+  @@index([subscriptionId])
+}
+
+model Discount {
+  id                String    @id @default(cuid())
+  name              String
+  kind              String
+  value             Decimal   @db.Decimal(12, 2)
+  scope             String
+  minPurchaseAmount Decimal?  @db.Decimal(12, 2)
+  minQuantity       Int?
+  startsOn          DateTime  @db.Date
+  endsOn            DateTime? @db.Date
+  maxUses           Int?
+  timesUsed         Int       @default(0)
+  isActive          Boolean   @default(true)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(6)
+  products          DiscountProduct[]
+  subscriptions     SubscriptionDiscount[]
+  invoices          InvoiceDiscount[]
+}
+
+model DiscountProduct {
+  discountId String
+  discount   Discount @relation(fields: [discountId], references: [id], onDelete: Cascade)
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([discountId, productId])
+}
+
+model SubscriptionDiscount {
+  subscriptionId String
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  discountId     String
+  discount       Discount     @relation(fields: [discountId], references: [id], onDelete: Restrict)
+  appliedAt      DateTime     @default(now()) @db.Timestamptz(6)
+
+  @@id([subscriptionId, discountId])
+}
+
+model SubscriptionRequest {
+  id             String       @id @default(cuid())
+  subscriptionId String
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  customerId     String
+  customer       Customer     @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  requestType    String
+  status         String
+  requestedAt    DateTime     @default(now()) @db.Timestamptz(6)
+  customerNote   String?
+  reviewedById   String?
+  reviewedBy     User?        @relation(fields: [reviewedById], references: [id], onDelete: Restrict)
+  reviewedAt     DateTime?    @db.Timestamptz(6)
+  reviewNote     String?
+
+  @@index([subscriptionId, status])
+  @@index([status, requestedAt])
+}
+
+model Invoice {
+  id             String       @id @default(cuid())
+  number         String?      @unique
+  subscriptionId String
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  customerId     String
+  customer       Customer     @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  status         String
+  periodStart    DateTime     @db.Date
+  periodEnd      DateTime     @db.Date
+  issueDate      DateTime     @db.Date
+  dueDate        DateTime     @db.Date
+  subtotal       Decimal      @db.Decimal(12, 2)
+  discountTotal  Decimal      @db.Decimal(12, 2)
+  taxableTotal   Decimal      @db.Decimal(12, 2)
+  taxTotal       Decimal      @db.Decimal(12, 2)
+  total          Decimal      @db.Decimal(12, 2)
+  amountPaid     Decimal      @default(0) @db.Decimal(12, 2)
+  confirmedAt    DateTime?    @db.Timestamptz(6)
+  cancelledAt    DateTime?    @db.Timestamptz(6)
+  createdAt      DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime     @updatedAt @db.Timestamptz(6)
+  lines          InvoiceLine[]
+  discounts      InvoiceDiscount[]
+  payments       Payment[]
+
+  @@unique([subscriptionId, periodStart])
+  @@index([status, dueDate])
+  @@index([status, issueDate])
+  @@index([customerId])
+}
+
+model InvoiceLine {
+  id                String          @id @default(cuid())
+  invoiceId         String
+  invoice           Invoice         @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  productId         String
+  product           Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  variantId         String?
+  variant           ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  description       String
+  quantity          Int
+  unitPrice         Decimal         @db.Decimal(12, 2)
+  grossAmount       Decimal         @db.Decimal(12, 2)
+  allocatedDiscount Decimal         @default(0) @db.Decimal(12, 2)
+  taxableAmount     Decimal         @db.Decimal(12, 2)
+  taxId             String?
+  tax               Tax?            @relation(fields: [taxId], references: [id], onDelete: Restrict)
+  taxRatePercent    Decimal         @db.Decimal(5, 2)
+  taxAmount         Decimal         @db.Decimal(12, 2)
+  sortOrder         Int
+
+  @@index([invoiceId])
+}
+
+model InvoiceDiscount {
+  invoiceId  String
+  invoice    Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  discountId String
+  discount   Discount @relation(fields: [discountId], references: [id], onDelete: Restrict)
+  amount     Decimal  @db.Decimal(12, 2)
+
+  @@id([invoiceId, discountId])
+}
+
+model Payment {
+  id           String   @id @default(cuid())
+  invoiceId    String
+  invoice      Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  amount       Decimal  @db.Decimal(12, 2)
+  method       String
+  paidOn       DateTime @db.Date
+  note         String?
+  recordedById String
+  recordedBy   User     @relation(fields: [recordedById], references: [id], onDelete: Restrict)
+  createdAt    DateTime @default(now()) @db.Timestamptz(6)
+
+  @@index([invoiceId])
+  @@index([paidOn, method])
+}
+
+model BillingRun {
+  id                              String    @id @default(cuid())
+  runDate                         DateTime  @db.Date
+  status                          String
+  maxPeriodsPerSubscription       Int
+  invoicesGenerated               Int       @default(0)
+  subscriptionsFullyProcessed     Int       @default(0)
+  subscriptionsPartiallyProcessed Int       @default(0)
+  subscriptionsSkipped            Int       @default(0)
+  subscriptionsFailed             Int       @default(0)
+  subscriptionsPending            Int       @default(0)
+  startedById                     String
+  startedBy                       User      @relation(fields: [startedById], references: [id], onDelete: Restrict)
+  startedAt                       DateTime  @default(now()) @db.Timestamptz(6)
+  finishedAt                      DateTime? @db.Timestamptz(6)
+  auditLogs                       AuditLog[]
+}
+
+model SubscriptionCounter {
+  id        Int @id
+  lastValue Int @default(0)
+}
+
+model InvoiceCounter {
+  year      Int @id
+  lastValue Int @default(0)
+}
+
+model AuditLog {
+  id           String      @id @default(cuid())
+  seq          BigInt      @unique @default(autoincrement())
+  actorId      String?
+  actor        User?       @relation(fields: [actorId], references: [id], onDelete: Restrict)
+  billingRunId String?
+  billingRun   BillingRun? @relation(fields: [billingRunId], references: [id], onDelete: Restrict)
+  action       String
+  entityType   String
+  entityId     String
+  fromStatus   String?
+  toStatus     String?
+  metadata     Json?
+  createdAt    DateTime    @default(dbgenerated("clock_timestamp()")) @db.Timestamptz(6)
+
+  @@index([entityType, entityId, seq])
+  @@index([createdAt])
+  @@index([billingRunId, seq])
+}
+
+model EmailOutbox {
+  id        String   @id @default(cuid())
+  toAddress String
+  subject   String
+  body      String
+  kind      String
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  @@index([createdAt])
+}
+
+model SystemSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+}
